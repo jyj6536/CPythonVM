@@ -19,15 +19,15 @@ typedef struct {
 } PyVarObject;
 ```
 
-![image-20201022230502367](/home/jyj6536/文档/笔记/Python源码学习/Python对象基石.assets/image-20201022230502367.png "基本对象与变长对象")
+![image-20201022230502367](./Python对象基石.assets/image-20201022230502367.png "基本对象与变长对象")
 
 ## PyType_Type与其他对象
 
-![image-20201024201503278](/home/jyj6536/文档/笔记/Python源码学习/Python对象基石.assets/image-20201024201503278.png)
+![image-20201024201503278](./Python对象基石.assets/image-20201024201503278.png)
 
 ## Python中long/int对象的内存布局
 
-![image-20201024225006234](/home/jyj6536/文档/笔记/Python源码学习/Python对象基石.assets/image-20201024225006234.png)
+![image-20201024225006234](./Python对象基石.assets/image-20201024225006234.png)
 
 ### Python中的整数存储方法
 
@@ -35,7 +35,7 @@ typedef struct {
 
 ob_size为0代表整数0，这是一种特殊情况．
 
-![image-20201026224802741](/home/jyj6536/文档/笔记/Python源码学习/Python对象基石.assets/image-20201026224802741.png)
+![image-20201026224802741](./Python对象基石.assets/image-20201026224802741.png)
 
 #### 整数1
 
@@ -62,13 +62,13 @@ typedef long stwodigits; /* signed variant of twodigits */
 
 当我们需要存储整数1的时候，ob_size的值变成了1表示ob_digit的长度为1，ob_digit以unsigned short的方式存储了整数1．
 
-![image-20201026225953081](/home/jyj6536/文档/笔记/Python源码学习/Python对象基石.assets/image-20201026225953081.png)
+![image-20201026225953081](./Python对象基石.assets/image-20201026225953081.png)
 
 #### 整数-1
 
 ob_size的正负代表整数的正负，ob_size为负值代表整数为负值．
 
-![image-20201026230223083](/home/jyj6536/文档/笔记/Python源码学习/Python对象基石.assets/image-20201026230223083.png)
+![image-20201026230223083](./Python对象基石.assets/image-20201026230223083.png)
 
 
 
