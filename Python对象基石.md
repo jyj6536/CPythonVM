@@ -86,7 +86,7 @@ ob_size的正负代表整数的正负，ob_size为负值代表整数为负值．
 
 ![image-20201029211447125](Python对象基石.assets/image-20201029211447125.png)
 
-上图为-262143的存储方式．digit之内的比特存储顺序与机器一直，而digit和digit之间则是按照权重的digit在最右边的方式存储（小端存储）．
+上图为-262143的存储方式．digit之内的比特存储顺序与机器一致，而digit和digit之间则是按照权重的digit在最右边的方式存储（小端存储）．
 
 #### 加法
 
@@ -153,11 +153,15 @@ for (i = 0; i < size_b; ++i) {
 
 此时，carry的低15位为＂本位＂，需要留在第0个ob_digit中
 
-```z->ob_digit[i] = carry & PyLong_MASK;```
+```c
+z->ob_digit[i] = carry & PyLong_MASK;
+```
 
 carry的最高位为进位，需要在下一次运算中参与计算
 
-```carry >>= PyLong_SHIFT;```
+```C
+carry >>= PyLong_SHIFT;
+```
 
 ![image-20201029230246079](Python对象基石.assets/image-20201029230246079.png)
 
@@ -184,9 +188,9 @@ for (; i < size_a; ++i) {
 
 最后，如果最终的carry为0的话，Python对z进行了规格化（去掉多余的0）
 
-```return long_normalize(z);```
-
-
+```c
+return long_normalize(z);
+```
 
 ### 小整数对象池smallints
 
