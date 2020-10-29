@@ -182,7 +182,7 @@ for (; i < size_a; ++i) {
 
 ![image-20201029231732079](Python对象基石.assets/image-20201029231732079.png)
 
-得到的carry右移之后赋值给z的最右边的ob_digit
+得到的carry右移之后赋值给z对应的ob_digit
 
 ![image-20201029232207551](Python对象基石.assets/image-20201029232207551.png)
 
