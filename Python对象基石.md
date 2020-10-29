@@ -1,4 +1,4 @@
-## Python对象基石
+Python对象基石
 
 ### 基本对象PyObject
 
@@ -81,6 +81,112 @@ ob_size的正负代表整数的正负，ob_size为负值代表整数为负值．
 整数32768的二进制表示为1000 0000 0000 0000，可以使用一个digit表示，但是在Python中，每个digit的最高位备用做保留位，所以32768要使用两个digit表示．
 
 ![image-20201027231205076](Python对象基石.assets/image-20201027231205076.png)
+
+#### 大端与小端
+
+![image-20201029211447125](Python对象基石.assets/image-20201029211447125.png)
+
+上图为-262143的存储方式．digit之内的比特存储顺序与机器一直，而digit和digit之间则是按照权重的digit在最右边的方式存储（小端存储）．
+
+#### 加法
+
+Python中整数存储中的保留位以及存储方式为计算带来了方便．以
+
+a = 1073741824 - 1
+
+b = 1
+
+为例进行说明．
+
+首先是这两个数字在内存中的存储方式
+
+a的存储方式
+
+![image-20201029215416748](Python对象基石.assets/image-20201029215416748.png)
+
+b的存储方式
+
+![image-20201029221657867](Python对象基石.assets/image-20201029221657867.png)
+
+##### 第一步
+
+```C
+static PyLongObject *
+x_add(PyLongObject *a, PyLongObject *b)
+{
+    Py_ssize_t size_a = Py_ABS(Py_SIZE(a)), size_b = Py_ABS(Py_SIZE(b));
+    PyLongObject *z;
+    Py_ssize_t i;
+    digit carry = 0;
+
+    /* Ensure a is the larger of the two: */
+    if (size_a < size_b) {
+        { PyLongObject *temp = a; a = b; b = temp; }
+        { Py_ssize_t size_temp = size_a;
+            size_a = size_b;
+            size_b = size_temp; }
+    }
+    z = _PyLong_New(size_a+1);
+    if (z == NULL)
+        return NULL;
+```
+
+首先确保a是最长的，并初始化一个临时变量z（长度为a与b中最长的长度加1）用于存放最终结果，一个digit变量carry用于计算．
+
+![image-20201029221746313](Python对象基石.assets/image-20201029221746313.png)
+
+##### 第二步
+
+```c
+for (i = 0; i < size_b; ++i) {
+        carry += a->ob_digit[i] + b->ob_digit[i];
+        z->ob_digit[i] = carry & PyLong_MASK;
+        carry >>= PyLong_SHIFT;
+    }
+```
+
+将a与b对应的部分相加，并使用carry＂运载＂计算结果存放在z中．
+
+首先，a与b的第0个ob_digit以及carry相加，结果放到carry中．
+
+![image-20201029223603711](Python对象基石.assets/image-20201029223603711.png)
+
+此时，carry的低15位为＂本位＂，需要留在第0个ob_digit中
+
+```z->ob_digit[i] = carry & PyLong_MASK;```
+
+carry的最高位为进位，需要在下一次运算中参与计算
+
+```carry >>= PyLong_SHIFT;```
+
+![image-20201029230246079](Python对象基石.assets/image-20201029230246079.png)
+
+当b中所有ob_digit都参与运算之后，跳出循环，进入下一个循环．
+
+##### 第三步
+
+由于carry中可能还有残留的进位，所以需要继续进行carry与a运算．
+
+```C
+for (; i < size_a; ++i) {
+        carry += a->ob_digit[i];
+        z->ob_digit[i] = carry & PyLong_MASK;
+        carry >>= PyLong_SHIFT;
+    }
+    z->ob_digit[i] = carry;
+```
+
+![image-20201029231732079](Python对象基石.assets/image-20201029231732079.png)
+
+得到的carry右移之后赋值给z的最右边的ob_digit
+
+![image-20201029232207551](Python对象基石.assets/image-20201029232207551.png)
+
+最后，如果最终的carry为0的话，Python对z进行了规格化（去掉多余的0）
+
+```return long_normalize(z);```
+
+
 
 ### 小整数对象池smallints
 
