@@ -186,7 +186,7 @@ for (; i < size_a; ++i) {
 
 ![image-20201029232207551](Python对象基石.assets/image-20201029232207551.png)
 
-最后，如果最终的carry为0的话，Python对z进行了规格化（去掉多余的0）
+由于最后一次计算得到的carry可能为0，Python需要对z进行了规格化（去掉最高有效ob_digit上多余的0）
 
 ```c
 return long_normalize(z);
