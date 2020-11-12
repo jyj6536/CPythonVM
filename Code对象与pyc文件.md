@@ -77,3 +77,63 @@ co_cellvars ()
 **co_stacksize**：执行该段Code Block需要多少栈空间．
 
 **co_flags**：一个整数，表示函数本身的属性的组合．
+
+**co_firstlineno**：Code Block在对应的py文件中的起始行．
+
+**co_code**：Code Block编译所的到的字节码指令序列，以PyStringObject的形式存在．
+
+**co_consts**：一个元组对象, 包含了函数中用到的所有常量. 比如 整数, 字符串对象, 和布尔对象. 这个元组里面的内容会在字节码 LOAD_CONST 执行的时候用到, LOAD_CONST 后面会跟一个参数, 这个参数表示 co_consts 的下标位置．
+
+**co_names**：一个元组, 元组里的对象都是字符串对象, 存储着属性, 全局变量名称, 导入的名称等信息. 用到这部分信息的字节码(比如 LOAD_ATTR)后面跟一个参数, 表示这个 co_names 的下标位置．
+
+**co_varnames**：一个元组对象, 包括了函数用到的参数名称和局部变量名称, 参数名称包括普通参数, *args 和 **kwargs, 这些名称在元组里的顺序和在函数对象中第一次使用到的顺序相同．
+
+**co_cellvars** 与 **co_freevars**：函数闭包相关变量．
+
+**co_name**：Code Block的名字，通常是函数名或者类名．
+
+**co_lnotab**：字节码指令与source code行号的对应关系，以PyStringObject的形式存在．
+
+### co_lnotab 和 co_firstlineno
+
+将字节码与对应行关联起来．co_lnotab中的每两个元素作为一个二元组，分别表示字节码位置以及行数的增量．
+
+```python
+import dis
+
+def f1(x):
+    x = 3
+    y = 4
+
+def f2(x):
+    x = 5
+    y = 6
+print(f2.__code__.co_firstlineno)
+print(repr(list(bytearray(f2.__code__.co_lnotab))))
+print(dis.dis(f2))
+```
+
+输出
+
+```python
+7
+[0, 1, 4, 1]
+  8           0 LOAD_CONST               1 (5)
+              2 STORE_FAST               0 (x)
+
+  9           4 LOAD_CONST               2 (6)
+              6 STORE_FAST               1 (y)
+              8 LOAD_CONST               0 (None)
+             10 RETURN_VALUE
+None
+
+```
+
+x=5的第一条字节码在字节码序列中的位置为0，对应的源文件行数为co_firstlineno(7)+1=8；y=9的第一条字节码在字节码序列中的位置为4，对应的行数为8+1=9．
+
+### co_zombieframe
+
+每个code对象都会保持一个 "zombie" frame, 这样做能保持一个frame对象分配的空间和初始化的信息不变下一次同一个code对象需要创建一个frame对象的时候, 直接用 "zombie" frame 上的对象, 可以节省 malloc/ realloc 的开销和初始化字段的开销．
+
+## 创建pyc文件的具体过程
+
