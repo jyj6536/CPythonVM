@@ -4,7 +4,7 @@ Python虽然是一种解释性的语言，其执行过程依然要有编译的�
 
 ![image-20201109222814061](Code对象与pyc文件.assets/image-20201109222814061.png)
 
-Python编译器在对Python源代码进行编译的时候，对于代码中的每一个Code Block，都会创建一个PyCodeObject对象与之对应。对于如何确定Code Block，Python的规则为：每当进入一个新的作用域，就算是进入一个新的Code Block。
+Python编译器在对Python源代码进行编译的时候，对于代码中的每一个Code Block，都会创建一个PyCodeObject对象与之对应。对于如何确定Code Block，Python的规则为：每当进入一个新的名字空间，就算是进入一个新的Code Block。
 
 ## 字段含义
 
@@ -134,6 +134,4 @@ x=5的第一条字节码在字节码序列中的位置为0，对应的源文件�
 ### co_zombieframe
 
 每个code对象都会保持一个 "zombie" frame, 这样做能保持一个frame对象分配的空间和初始化的信息不变下一次同一个code对象需要创建一个frame对象的时候, 直接用 "zombie" frame 上的对象, 可以节省 malloc/ realloc 的开销和初始化字段的开销．
-
-## 创建pyc文件的具体过程
 
