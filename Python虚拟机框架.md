@@ -152,3 +152,63 @@ f_valuestack维护栈底，f_stacktop维护栈顶．
 
 ![image-20201115115451527](Python虚拟机框架.assets/image-20201115115451527.png)
 
+### frame执行过程
+
+以一个生成器为例来看frame的执行过程。
+
+```python
+def g2(a, b=1, c=2):
+    yield a
+    c = str(b + c)
+    yield c
+    new_g = range(3)
+    yield from new_g
+```
+
+使用dis对上述代码进行编译
+
+```Pyhton
+#python -m dis frame_dis.py
+  1           0 LOAD_CONST               5 ((1, 2))
+              2 LOAD_CONST               2 (<code object g2 at 0x000001D58DD90190, file ".\frame_dis.py", line 1>)
+              4 LOAD_CONST               3 ('g2')
+              6 MAKE_FUNCTION            1 (defaults)
+              8 STORE_NAME               0 (g2)
+             10 LOAD_CONST               4 (None)
+             12 RETURN_VALUE
+
+Disassembly of <code object g2 at 0x000001D58DD90190, file ".\frame_dis.py", line 1>:
+  2           0 LOAD_FAST                0 (a)
+              2 YIELD_VALUE
+              4 POP_TOP
+
+  3           6 LOAD_GLOBAL              0 (str)
+              8 LOAD_FAST                1 (b)
+             10 LOAD_FAST                2 (c)
+             12 BINARY_ADD
+             14 CALL_FUNCTION            1
+             16 STORE_FAST               2 (c)
+
+  4          18 LOAD_FAST                2 (c)
+             20 YIELD_VALUE
+             22 POP_TOP
+
+  5          24 LOAD_GLOBAL              1 (range)
+             26 LOAD_CONST               1 (3)
+             28 CALL_FUNCTION            1
+             30 STORE_FAST               3 (new_g)
+
+  6          32 LOAD_FAST                3 (new_g)
+             34 GET_YIELD_FROM_ITER
+             36 LOAD_CONST               0 (None)
+             38 YIELD_FROM
+             40 POP_TOP
+             42 LOAD_CONST               0 (None)
+             44 RETURN_VALUE
+gg = g2("param a")
+f = gg.gi_frame
+```
+
+初始状态下frame中各个域的状态如下
+
+![image-20201117082538260](Python虚拟机框架.assets/image-20201117082538260.png)
