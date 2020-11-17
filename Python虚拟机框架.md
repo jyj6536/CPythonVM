@@ -212,3 +212,79 @@ f = gg.gi_frame
 初始状态下frame中各个域的状态如下
 
 ![image-20201117082538260](Python虚拟机框架.assets/image-20201117082538260.png)
+
+执行一次next(gg)
+
+![image-20201117221706947](Python虚拟机框架.assets/image-20201117221706947.png)
+
+此时frame中各个域的值如下
+
+![image-20201117222031204](Python虚拟机框架.assets/image-20201117222031204.png)
+
+f_lasti=2说明此时yield_value已经执行．字节码load_fast会把对应的参数入栈，而yield_value会弹出栈顶的元素；f_valuestack(栈底)的值不会发生变化；而f_stacktop(栈顶)由于先入栈后出栈所以值与初始状态一致；由于出栈不会清空相应的栈空间，所以此时栈底放的是之前入栈的局部变量a．
+
+继续执行next(gg)
+
+![image-20201117222734907](Python虚拟机框架.assets/image-20201117222734907.png)
+
+此时frame中各个域的值如下
+
+![image-20201117223540533](Python虚拟机框架.assets/image-20201117223540533.png)
+
+load_global 0 将f.f_code.co_names[0]处的对象压入堆栈，8与10的load_fast分别将b与c压入堆栈．12的binary_add将栈顶的两个元素弹出，相加之后压入栈顶．binary_add执行之后的栈空间如上图所示．
+
+call_function 1会弹出可执行对象及其参数，执行之后将执行结果入栈，此时的栈空间如下图所示
+
+![image-20201117224329343](Python虚拟机框架.assets/image-20201117224329343.png)
+
+16 store_fast 2会弹出栈顶元素，并将其存储到f_localsplus下标为2的位置中(c)．
+
+![image-20201117224804472](Python虚拟机框架.assets/image-20201117224804472.png)
+
+18 load_fast 2把f_localsplus下标为2的元素入栈，之后的20 yield_value将栈顶元素出栈并传递给调用者
+
+![image-20201117225131266](Python虚拟机框架.assets/image-20201117225131266.png)
+
+![image-20201117225547860](Python虚拟机框架.assets/image-20201117225547860.png)
+
+f_lasti的值为20说明当前的程序位置在20 yield_value的位置
+
+执行24 load_global 1以及26 load_const 1之后的栈空间
+
+![image-20201117232050876](Python虚拟机框架.assets/image-20201117232050876.png)
+
+首先，load_global 1指示python虚拟机从co_names中下标1处的名字所对应的对象入栈，co_names的内容如下
+
+![image-20201117231259322](Python虚拟机框架.assets/image-20201117231259322.png)
+
+虚拟机使用'range'这个名字分别在f_locals，f_globals以及f_builtins中寻找对应的对象（在f_builtins中找到）
+
+![image-20201117231529883](Python虚拟机框架.assets/image-20201117231529883.png)
+
+load_const 1指示虚拟机将co_consts下标1处的对象入栈，co_consts的内容如下
+
+![image-20201117231706468](Python虚拟机框架.assets/image-20201117231706468.png)
+
+执行28 call_function 1之后
+
+![image-20201117232154323](Python虚拟机框架.assets/image-20201117232154323.png)
+
+执行30 store_fast 3之后
+
+![image-20201117232330436](Python虚拟机框架.assets/image-20201117232330436.png)
+
+执行32 load_fast 3之后
+
+![image-20201117232455909](Python虚拟机框架.assets/image-20201117232455909.png)
+
+34 get_yield_from_iter的作用是保证栈顶元素是一个可迭代对象
+
+34 load_const 0的作用是把None入栈
+
+![image-20201117232730964](Python虚拟机框架.assets/image-20201117232730964.png)
+
+栈帧对象在抛出StopIteration之后就进入了释放阶段(44 return_value执行之后)
+
+![image-20201117233441211](Python虚拟机框架.assets/image-20201117233441211.png)
+
+![image-20201117233531951](Python虚拟机框架.assets/image-20201117233531951.png)
