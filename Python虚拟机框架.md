@@ -288,3 +288,118 @@ load_const 1指示虚拟机将co_consts下标1处的对象入栈，co_consts的�
 ![image-20201117233441211](Python虚拟机框架.assets/image-20201117233441211.png)
 
 ![image-20201117233531951](Python虚拟机框架.assets/image-20201117233531951.png)
+
+### _PyEval_EvalFrameDefault
+
+```C
+PyObject*
+_PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
+{
+    PyObject **stack_pointer;  /* Next free slot in value stack */
+    const _Py_CODEUNIT *next_instr;
+    int opcode;        /* Current opcode */
+    int oparg;         /* Current opcode argument, if any */
+    PyObject **fastlocals, **freevars;
+    PyObject *retval = NULL;            /* Return value */
+    PyThreadState *tstate = _PyThreadState_GET();
+    PyCodeObject *co;
+    int instr_ub = -1, instr_lb = 0, instr_prev = -1;
+
+    const _Py_CODEUNIT *first_instr;
+    PyObject *names;
+    PyObject *consts;
+    /*
+    ...
+    */
+    co = f->f_code;
+    names = co->co_names;
+    consts = co->co_consts;
+    fastlocals = f->f_localsplus;
+    freevars = f->f_localsplus + co->co_nlocals;
+    assert(PyBytes_Check(co->co_code));
+    assert(PyBytes_GET_SIZE(co->co_code) <= INT_MAX);
+    assert(PyBytes_GET_SIZE(co->co_code) % sizeof(_Py_CODEUNIT) == 0);
+    assert(_Py_IS_ALIGNED(PyBytes_AS_STRING(co->co_code), sizeof(_Py_CODEUNIT)));
+    first_instr = (_Py_CODEUNIT *) PyBytes_AS_STRING(co->co_code);
+    /*
+       f->f_lasti refers to the index of the last instruction,
+       unless it's -1 in which case next_instr should be first_instr.
+
+       YIELD_FROM sets f_lasti to itself, in order to repeatedly yield
+       multiple values.
+
+       When the PREDICT() macros are enabled, some opcode pairs follow in
+       direct succession without updating f->f_lasti.  A successful
+       prediction effectively links the two codes together as if they
+       were a single new opcode; accordingly,f->f_lasti will point to
+       the first code in the pair (for instance, GET_ITER followed by
+       FOR_ITER is effectively a single opcode and f->f_lasti will point
+       to the beginning of the combined pair.)
+    */
+    assert(f->f_lasti >= -1);
+    next_instr = first_instr;
+    if (f->f_lasti >= 0) {
+        assert(f->f_lasti % sizeof(_Py_CODEUNIT) == 0);
+        next_instr += f->f_lasti / sizeof(_Py_CODEUNIT) + 1;
+    }
+    stack_pointer = f->f_stacktop;
+    assert(stack_pointer != NULL);
+    f->f_stacktop = NULL;       /* remains NULL unless yield suspends frame */
+    f->f_executing = 1;
+    /*
+    */
+}
+    
+```
+
+_PyEval_EvalFrameDefault函数就是Python虚拟机的具体实现．在这个函数中，code对象中的字节码被一条一条执行．在该函数中，首先是一些变量的定义以及初始化工作．从初始化过程我们可以看出，code对象中的各个信息都被照顾到了．
+
+在Python中，利用3个变量来完成整个遍历过程．首先，co_code在python3中是一个PyBytes对象，bytes对象中使用char数组进行内容存储．在这里PyBytes_AS_STRING宏进行了类型检查并直接返回了co_code对象中的char数组的指针．first_instr指向字节码指令序列开始的位置．next_instr指向下一跳待执行的字节码指令的位置．f_lasti指向上一条已经执行的字节码指令的位置．
+
+Python虚拟机执行字节码指令实际上就是一个for循环加上一个巨大的switch/case结构．
+
+```C
+main_loop:
+    for (;;) {
+/*
+
+*/
+    	fast_next_opcode:
+        f->f_lasti = INSTR_OFFSET();
+        /*
+        */
+        NEXTOPARG();//获取字节码以及参数的宏定义
+        switch (opcode) {
+
+        /* BEWARE!
+           It is essential that any operation that fails must goto error
+           and that all operation that succeed call [FAST_]DISPATCH() ! */
+
+        case TARGET(NOP): {
+            FAST_DISPATCH();
+        }
+        /*.....*/
+        }
+```
+
+NEXTOPARG()是获取字节码以及相应参数的宏定义，其展开之后如下
+
+```C
+#define NEXTOPARG()  do { \
+        _Py_CODEUNIT word = *next_instr; \
+        opcode = _Py_OPCODE(word); \
+        oparg = _Py_OPARG(word); \
+        next_instr++; \
+    } while (0)
+
+#ifdef WORDS_BIGENDIAN
+#  define _Py_OPCODE(word) ((word) >> 8)
+#  define _Py_OPARG(word) ((word) & 255)
+#else
+#  define _Py_OPCODE(word) ((word) & 255)
+#  define _Py_OPARG(word) ((word) >> 8)
+#endif
+```
+
+成功执行完一条字节码指令之后，Python的执行流程会跳转到fast_next_opcode或者main_loop处继续执行接下来的opcode．如此循环往复，最终完成了对Python程序的执行．
+
