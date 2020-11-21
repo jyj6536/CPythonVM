@@ -257,7 +257,7 @@ f_lasti的值为20说明当前的程序位置在20 yield_value的位置
 
 ![image-20201117231259322](Python虚拟机框架.assets/image-20201117231259322.png)
 
-虚拟机使用'range'这个名字分别在f_locals，f_globals以及f_builtins中寻找对应的对象（在f_builtins中找到）
+虚拟机使用'range'这个名字分别在f_globals以及f_builtins中寻找对应的对象（在f_builtins中找到）
 
 ![image-20201117231529883](Python虚拟机框架.assets/image-20201117231529883.png)
 
@@ -578,3 +578,234 @@ PyInterpreter对象如上所示．
 通过上述描述，我们可以大体上勾勒出Python的运行时环境
 
 ![image-20201119215307378](Python虚拟机框架.assets/image-20201119215307378.png)
+
+### 部分Python字节码
+
+Python虚拟机中使用了大量的宏定义以提高执行效率．这些宏包括对栈的操作以及对tuple对象的访问操作．字节码的执行过程中大量使用了这些宏定义．
+
+```C
+#define STACK_LEVEL()     ((int)(stack_pointer - f->f_valuestack))
+#define EMPTY()           (STACK_LEVEL() == 0)
+#define TOP()             (stack_pointer[-1])
+#define SECOND()          (stack_pointer[-2])
+#define THIRD()           (stack_pointer[-3])
+#define FOURTH()          (stack_pointer[-4])
+#define PEEK(n)           (stack_pointer[-(n)])
+#define SET_TOP(v)        (stack_pointer[-1] = (v))
+#define SET_SECOND(v)     (stack_pointer[-2] = (v))
+#define SET_THIRD(v)      (stack_pointer[-3] = (v))
+#define SET_FOURTH(v)     (stack_pointer[-4] = (v))
+#define SET_VALUE(n, v)   (stack_pointer[-(n)] = (v))
+#define BASIC_STACKADJ(n) (stack_pointer += n)
+#define BASIC_PUSH(v)     (*stack_pointer++ = (v))
+#define BASIC_POP()       (*--stack_pointer)
+```
+
+以上是对栈进行的相关操作．其中，stack_pointer是在_PyEval_EvalFrameDefault中所定义的PyObject**指针．
+
+```C
+#define GETITEM(v, i) PyTuple_GET_ITEM((PyTupleObject *)(v), (i))
+```
+
+访问tuple中元素的宏定义．
+
+#### **load_const**
+
+```C
+case TARGET(LOAD_CONST): {
+            PREDICTED(LOAD_CONST);
+            PyObject *value = GETITEM(consts, oparg);
+            Py_INCREF(value);
+            PUSH(value);
+            FAST_DISPATCH();
+        }
+```
+
+load_const指令很简单，就是从consts这个tuple中将oparg位置的对象入栈，同时增加该对象的引用计数．通过追踪_PyEval_EvalFrameDefault中的代码我们可以发现，consts就是code对象中的co_consts对象.
+
+```C
+co = f->f_code;
+/*...*/
+consts = co->co_consts;
+```
+
+#### **load_fast**
+
+```c
+
+case TARGET(LOAD_FAST): {
+PyObject *value = GETLOCAL(oparg);
+if (value == NULL) {
+format_exc_check_arg(PyExc_UnboundLocalError,
+UNBOUNDLOCAL_ERROR_MSG,
+PyTuple_GetItem(co->co_varnames, oparg));
+goto error;
+}
+Py_INCREF(value);
+PUSH(value);
+FAST_DISPATCH();
+}
+#define GETLOCAL(i)     (fastlocals[i])
+```
+
+我们知道，frame对象当中有一段变长的内存空间（见新建frame对象的内存布局）．在虚拟机的执行过程中，fastlocals指向了这一段内存．
+
+```C
+fastlocals = f->f_localsplus;
+```
+
+fastlocals[i]表示第i个局部变量．load_fast即是将该局部变量入栈的字节码．
+
+#### **load_global**
+
+````C
+case TARGET(LOAD_GLOBAL): {
+            PyObject *name = GETITEM(names, oparg);
+            PyObject *v;
+            if (PyDict_CheckExact(f->f_globals)
+                && PyDict_CheckExact(f->f_builtins))
+            {
+                v = _PyDict_LoadGlobal((PyDictObject *)f->f_globals,
+                                       (PyDictObject *)f->f_builtins,
+                                       name);
+                if (v == NULL) {
+                    if (!_PyErr_OCCURRED()) {
+                        /* _PyDict_LoadGlobal() returns NULL without raising
+                         * an exception if the key doesn't exist */
+                        format_exc_check_arg(PyExc_NameError,
+                                             NAME_ERROR_MSG, name);
+                    }
+                    goto error;
+                }
+                Py_INCREF(v);
+            }
+            else {
+                /* Slow-path if globals or builtins is not a dict */
+
+                /* namespace 1: globals */
+                v = PyObject_GetItem(f->f_globals, name);
+                if (v == NULL) {
+                    if (!PyErr_ExceptionMatches(PyExc_KeyError))
+                        goto error;
+                    PyErr_Clear();
+
+                    /* namespace 2: builtins */
+                    v = PyObject_GetItem(f->f_builtins, name);
+                    if (v == NULL) {
+                        if (PyErr_ExceptionMatches(PyExc_KeyError))
+                            format_exc_check_arg(
+                                        PyExc_NameError,
+                                        NAME_ERROR_MSG, name);
+                        goto error;
+                    }
+                }
+            }
+            PUSH(v);
+            DISPATCH();
+        }
+````
+
+load_global的作用也很明显，就是从names(f->code->co_names)中找到oparg作为下标所对应的元素name，然后分别在global与builtin名字空间中寻找该name所对应的值，最后将其入栈．
+
+#### **load_name**
+
+```C
+        case TARGET(LOAD_NAME): {
+            PyObject *name = GETITEM(names, oparg);
+            PyObject *locals = f->f_locals;
+            PyObject *v;
+            if (locals == NULL) {
+                PyErr_Format(PyExc_SystemError,
+                             "no locals when loading %R", name);
+                goto error;
+            }
+            if (PyDict_CheckExact(locals)) {
+                v = PyDict_GetItem(locals, name);
+                Py_XINCREF(v);
+            }
+            else {
+                v = PyObject_GetItem(locals, name);
+                if (v == NULL) {
+                    if (!PyErr_ExceptionMatches(PyExc_KeyError))
+                        goto error;
+                    PyErr_Clear();
+                }
+            }
+            if (v == NULL) {
+                v = PyDict_GetItem(f->f_globals, name);
+                Py_XINCREF(v);
+                if (v == NULL) {
+                    if (PyDict_CheckExact(f->f_builtins)) {
+                        v = PyDict_GetItem(f->f_builtins, name);
+                        if (v == NULL) {
+                            format_exc_check_arg(
+                                        PyExc_NameError,
+                                        NAME_ERROR_MSG, name);
+                            goto error;
+                        }
+                        Py_INCREF(v);
+                    }
+                    else {
+                        v = PyObject_GetItem(f->f_builtins, name);
+                        if (v == NULL) {
+                            if (PyErr_ExceptionMatches(PyExc_KeyError))
+                                format_exc_check_arg(
+                                            PyExc_NameError,
+                                            NAME_ERROR_MSG, name);
+                            goto error;
+                        }
+                    }
+                }
+            }
+            PUSH(v);
+            DISPATCH();
+        }
+```
+
+与load_global相似，只不过load_name首先从local名字空间中开始查找，之后才是global与builtin．
+
+#### **store_name**
+
+```C
+case TARGET(STORE_NAME): {
+            PyObject *name = GETITEM(names, oparg);
+            PyObject *v = POP();
+            PyObject *ns = f->f_locals;
+            int err;
+            if (ns == NULL) {
+                PyErr_Format(PyExc_SystemError,
+                             "no locals found when storing %R", name);
+                Py_DECREF(v);
+                goto error;
+            }
+            if (PyDict_CheckExact(ns))
+                err = PyDict_SetItem(ns, name, v);
+            else
+                err = PyObject_SetItem(ns, name, v);
+            Py_DECREF(v);
+            if (err != 0)
+                goto error;
+            DISPATCH();
+        }
+```
+
+f_locals是一个可映射对象．在这里虚拟机首先从names(f->code->co_names)中找到oparg作为下标所对应的元素name，然后将栈顶的值v弹出，在f_locals中建立一个name与v的对应关系．
+
+#### **build_list**
+
+```C
+        case TARGET(BUILD_LIST): {
+            PyObject *list =  PyList_New(oparg);
+            if (list == NULL)
+                goto error;
+            while (--oparg >= 0) {
+                PyObject *item = POP();
+                PyList_SET_ITEM(list, oparg, item);
+            }
+            PUSH(list);
+            DISPATCH();
+        }
+```
+
+build_list指令的参数指定了build_list的长度．可以预见，在build_list指令之前肯定有许多load指令进行压栈操作将list对象的成员压入堆栈．
+
