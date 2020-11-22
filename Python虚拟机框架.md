@@ -654,7 +654,7 @@ FAST_DISPATCH();
 fastlocals = f->f_localsplus;
 ```
 
-fastlocals[i]表示第i个局部变量．load_fast即是将该局部变量入栈的字节码．
+fastlocals[i]表示第i个局部变量．load_fast即是将该局部变量入栈的字节码． 
 
 #### **load_global**
 
