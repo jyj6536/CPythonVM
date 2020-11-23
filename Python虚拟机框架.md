@@ -809,3 +809,66 @@ f_locals是一个可映射对象．在这里虚拟机首先从names(f->code->co_
 
 build_list指令的参数指定了build_list的长度．可以预见，在build_list指令之前肯定有许多load指令进行压栈操作将list对象的成员压入堆栈．
 
+#### **compare_op**
+
+在python中，if控制流由compare_op字节码实现．
+
+```python
+def a():
+    if a == 1:
+        print("a==1")
+    else:
+        print("a!=1")
+```
+
+字节码
+
+```C
+  2           0 LOAD_GLOBAL              0 (a)
+              2 LOAD_CONST               1 (1)
+              4 COMPARE_OP               2 (==)
+              6 POP_JUMP_IF_FALSE       18
+
+  3           8 LOAD_GLOBAL              1 (print)
+             10 LOAD_CONST               2 ('a==1')
+             12 CALL_FUNCTION            1
+             14 POP_TOP
+             16 JUMP_FORWARD             8 (to 26)
+
+  5     >>   18 LOAD_GLOBAL              1 (print)
+             20 LOAD_CONST               3 ('a!=1')
+             22 CALL_FUNCTION            1
+             24 POP_TOP
+        >>   26 LOAD_CONST               0 (None)
+             28 RETURN_VALUE
+
+```
+
+compare_op指令的参数对应了不同的比较操作，这些比较操作在opcode.h中定义．
+
+```C
+enum cmp_op {PyCmp_LT=Py_LT, PyCmp_LE=Py_LE, PyCmp_EQ=Py_EQ, PyCmp_NE=Py_NE,
+                PyCmp_GT=Py_GT, PyCmp_GE=Py_GE, PyCmp_IN, PyCmp_NOT_IN,
+                PyCmp_IS, PyCmp_IS_NOT, PyCmp_EXC_MATCH, PyCmp_BAD};
+```
+
+在本例中，==对应的是枚举中的第二个枚举值（Py_EQ）.
+
+接下来，我们来看一下compare_op的具体实现．
+
+```C
+case TARGET(COMPARE_OP): {
+            PyObject *right = POP();
+            PyObject *left = TOP();
+            PyObject *res = cmp_outcome(oparg, left, right);
+            Py_DECREF(left);
+            Py_DECREF(right);
+            SET_TOP(res);
+            if (res == NULL)
+                goto error;
+            PREDICT(POP_JUMP_IF_FALSE);
+            PREDICT(POP_JUMP_IF_TRUE);
+            DISPATCH();
+        }
+```
+
