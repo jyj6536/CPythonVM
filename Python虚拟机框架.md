@@ -872,3 +872,138 @@ case TARGET(COMPARE_OP): {
         }
 ```
 
+首先，从堆栈中分别获取左右操作数，然后调用com_outcome函数进行比较操作，该函数是compare_op字节码的关键，我们来看一下具体实现．
+
+```C
+static PyObject *
+cmp_outcome(int op, PyObject *v, PyObject *w)
+{
+    int res = 0;
+    switch (op) {
+    case PyCmp_IS:
+        res = (v == w);
+        break;
+    case PyCmp_IS_NOT:
+        res = (v != w);
+        break;
+    case PyCmp_IN:
+        res = PySequence_Contains(w, v);
+        if (res < 0)
+            return NULL;
+        break;
+    case PyCmp_NOT_IN:
+        res = PySequence_Contains(w, v);
+        if (res < 0)
+            return NULL;
+        res = !res;
+        break;
+    case PyCmp_EXC_MATCH:
+        if (PyTuple_Check(w)) {
+            Py_ssize_t i, length;
+            length = PyTuple_Size(w);
+            for (i = 0; i < length; i += 1) {
+                PyObject *exc = PyTuple_GET_ITEM(w, i);
+                if (!PyExceptionClass_Check(exc)) {
+                    PyErr_SetString(PyExc_TypeError,
+                                    CANNOT_CATCH_MSG);
+                    return NULL;
+                }
+            }
+        }
+        else {
+            if (!PyExceptionClass_Check(w)) {
+                PyErr_SetString(PyExc_TypeError,
+                                CANNOT_CATCH_MSG);
+                return NULL;
+            }
+        }
+        res = PyErr_GivenExceptionMatches(v, w);
+        break;
+    default:
+        return PyObject_RichCompare(v, w, op);
+    }
+    v = res ? Py_True : Py_False;
+    Py_INCREF(v);
+    return v;
+}
+```
+
+可以看到，参数op决定了cmp_outcome的比较动作．该函数不仅负责两个对象之间的比较操作，还涵盖了对象与集合之间的关系操作－－in与not in，对象是否为同一个对象的is与not is操作．可以清楚地看出，python中判断一个对象是否＂is＂另一个对象是比较两个对象的地址是否相同；判断一个对象是否在另一个集合中调用了PySequence_Contains函数．
+
+在default中，除了上述比较之外的比较操作在PyObject_RichCompare中进行．关于python中复杂的对象比较体系之后再研究．
+
+cmp_outcome执行之后所得到的返回值被赋值给栈顶（True或者False对象），然后执行跳转动作．这里使用了PREDICT宏进行指令预测．展开PREDICT宏的定义
+
+```C
+#define PREDICT(op) \
+    do{ \
+        _Py_CODEUNIT word = *next_instr; \
+        opcode = _Py_OPCODE(word); \
+        if (opcode == op){ \
+            oparg = _Py_OPARG(word); \
+            next_instr++; \
+            goto PRED_##op; \
+        } \
+    } while(0)
+```
+
+在python的字节码中，有一些字节码总是顺序出现的，这就为根据上一条字节码预测下一个字节码提供了可能．REDICT宏就是用来实现此功能的．在这里，Python虚拟机直接判断下一条指令是否为POP_JUMP_IF_FALSE或者POP_JUMP_IF_TRUE，如果是的话就直接跳转到PREDICTED(POP_JUMP_IF_FALSE)或者PREDICTED(POP_JUMP_IF_TRUE)处．
+
+#### pop_jump_if_false  与 pop_jump_if_true
+
+这两条字节码的实现相似，我们以pop_jump_if_false为例
+
+```C
+case TARGET(POP_JUMP_IF_FALSE): {
+            PREDICTED(POP_JUMP_IF_FALSE);
+            PyObject *cond = POP();
+            int err;
+            if (cond == Py_True) {
+                Py_DECREF(cond);
+                FAST_DISPATCH();
+            }
+            if (cond == Py_False) {
+                Py_DECREF(cond);
+                JUMPTO(oparg);
+                FAST_DISPATCH();
+            }
+            err = PyObject_IsTrue(cond);
+            Py_DECREF(cond);
+            if (err > 0)
+                ;
+            else if (err == 0)
+                JUMPTO(oparg);
+            else
+                goto error;
+            DISPATCH();
+        }
+```
+
+首先，从弹出栈顶对象．如果是True对象则直接执行下一条指令，否则如果是False对象则执行跳转－－JUMPTO宏．
+
+```C
+#define JUMPTO(x)       (next_instr = first_instr + (x) / sizeof(_Py_CODEUNIT))
+```
+
+JUMPTO宏使得python虚拟机的执行流程跳转到距离第一条字节码指令　(x) / sizeof(_Py_CODEUNIT)　条指令的地方继续执行．
+
+如果站定对象即不是True也不是False，那么执行PyObject_IsTrue对该对象进行判断．如果其不符合Python中规定的对象为真的条件，那么按照false处理(err == 0)．这针对的是python中直接将对象作为比较条件的情况．
+
+比如，
+
+```python
+def a(c):
+    if c:
+        return True
+#编译
+  2           0 LOAD_FAST                0 (c)
+              2 POP_JUMP_IF_FALSE        8
+
+  3           4 LOAD_CONST               1 (True)
+              6 RETURN_VALUE
+        >>    8 LOAD_CONST               0 (None)
+             10 RETURN_VALUE
+
+```
+
+上例中，if语句直接编译为pop_jump_if_false．
