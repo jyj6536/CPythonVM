@@ -987,7 +987,7 @@ case TARGET(POP_JUMP_IF_FALSE): {
 
 JUMPTO宏使得python虚拟机的执行流程跳转到距离第一条字节码指令　(x) / sizeof(_Py_CODEUNIT)　条指令的地方继续执行．
 
-如果站定对象即不是True也不是False，那么执行PyObject_IsTrue对该对象进行判断．如果其不符合Python中规定的对象为真的条件，那么按照false处理(err == 0)．这针对的是python中直接将对象作为比较条件的情况．
+如果站定对象既不是True也不是False，那么执行PyObject_IsTrue对该对象进行判断．如果其不符合Python中规定的对象为真的条件，那么按照false处理(err == 0)．这针对的是python中直接将对象作为比较条件的情况．
 
 比如，
 
