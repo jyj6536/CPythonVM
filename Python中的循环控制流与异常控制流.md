@@ -506,3 +506,86 @@ PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceback)
 ```
 
 最终，异常信息被保存在了tstate这个PyThreadState类型的对象中．
+
+PyThreadState对象是python用来模拟线程的对象。在python的运行过程中，真实线程的状态信息由操作系统维护，python虚拟机线程的状态信息保存在PyThreadState对象中。当前活动线程所对应的PyThreadState对象可以由_PyThreadState_GET()宏得到。
+
+现在，我们回到字节码binary_true_divide中。PyNumber_TrueDivide执行完成之后最终返回了NULL，也就是说由于除数为0，quotient最终为NULL。当执行到 if (quotient == NULL)分支时，条件成立，执行goto语句，跳转到error标签处并跳出switch结构。在这里，python的异常处理过程开始。
+
+```C
+PyObject*
+_PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
+{
+main_loop:
+    for (;;) {
+        /*
+        ...
+        */
+error:
+        /* Double-check exception status. */
+#ifdef NDEBUG
+        if (!_PyErr_Occurred(tstate)) {
+            _PyErr_SetString(tstate, PyExc_SystemError,
+                             "error return without exception set");
+        }
+#else
+        assert(_PyErr_Occurred(tstate));
+#endif
+
+        /* Log traceback info. */
+        PyTraceBack_Here(f);
+
+        if (tstate->c_tracefunc != NULL)
+            call_exc_trace(tstate->c_tracefunc, tstate->c_traceobj,
+                           tstate, f);
+
+exception_unwind:
+        /* Unwind stacks if an exception occurred */
+        while (f->f_iblock > 0) {
+            /*
+            处理try...except...finally语句块
+            */
+		} /* unwind stack */
+
+        /* End the loop as we still have an error */
+        break;    
+	} /* main loop */
+
+    assert(retval == NULL);
+    assert(_PyErr_Occurred(tstate));
+
+exit_returning:
+
+    /* Pop remaining stack entries. */
+    while (!EMPTY()) {
+        PyObject *o = POP();
+        Py_XDECREF(o);
+    }
+
+exit_yielding:
+    if (tstate->use_tracing) {
+        if (tstate->c_tracefunc) {
+            if (call_trace_protected(tstate->c_tracefunc, tstate->c_traceobj,
+                                     tstate, f, PyTrace_RETURN, retval)) {
+                Py_CLEAR(retval);
+            }
+        }
+        if (tstate->c_profilefunc) {
+            if (call_trace_protected(tstate->c_profilefunc, tstate->c_profileobj,
+                                     tstate, f, PyTrace_RETURN, retval)) {
+                Py_CLEAR(retval);
+            }
+        }
+    }
+
+    /* pop frame */
+exit_eval_frame:
+    if (PyDTrace_FUNCTION_RETURN_ENABLED())
+        dtrace_function_return(f);
+    Py_LeaveRecursiveCall();
+    f->f_executing = 0;
+    tstate->frame = f->f_back;
+
+    return _Py_CheckFunctionResult(NULL, retval, "PyEval_EvalFrameEx");
+}
+```
+
