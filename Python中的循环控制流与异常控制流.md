@@ -589,3 +589,78 @@ exit_eval_frame:
 }
 ```
 
+首先，python虚拟机检查了tstate中保存的异常信息，如果tstate中没有包含异常信息，那么可以认为错误发生．如果检查通过，那么接下来要调用PyTraceBack_Here函数进行异常信息的追踪．我们首先来看一下它的实现．
+
+```C
+int
+PyTraceBack_Here(PyFrameObject *frame)
+{
+    PyObject *exc, *val, *tb, *newtb;
+    PyErr_Fetch(&exc, &val, &tb);
+    newtb = tb_create_raw((PyTracebackObject *)tb, frame, frame->f_lasti,
+                          PyFrame_GetLineNumber(frame));
+    if (newtb == NULL) {
+        _PyErr_ChainExceptions(exc, val, tb);
+        return -1;
+    }
+    PyErr_Restore(exc, val, newtb);
+    Py_XDECREF(tb);
+    return 0;
+}
+
+void
+PyErr_Fetch(PyObject **p_type, PyObject **p_value, PyObject **p_traceback)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    //通过二重指针传参
+    *p_type = tstate->curexc_type;
+    *p_value = tstate->curexc_value;
+    *p_traceback = tstate->curexc_traceback;
+    //将tstate中与当前异常相关的信息设置为NULL
+    tstate->curexc_type = NULL;
+    tstate->curexc_value = NULL;
+    tstate->curexc_traceback = NULL;
+}
+
+static PyObject *
+tb_create_raw(PyTracebackObject *next, PyFrameObject *frame, int lasti,
+              int lineno)
+{
+    PyTracebackObject *tb;
+    if ((next != NULL && !PyTraceBack_Check(next)) ||
+                    frame == NULL || !PyFrame_Check(frame)) {
+        PyErr_BadInternalCall();
+        return NULL;
+    }
+    tb = PyObject_GC_New(PyTracebackObject, &PyTraceBack_Type);
+    if (tb != NULL) {
+        Py_XINCREF(next);
+        tb->tb_next = next;//指向之前的PyTraceback对象
+        Py_XINCREF(frame);
+        tb->tb_frame = frame;//保存当前栈帧
+        tb->tb_lasti = lasti;//保存当前执行的最后一条字节码
+        tb->tb_lineno = lineno;//保存当前执行的最后一条字节码的行号
+        PyObject_GC_Track(tb);
+    }
+    return (PyObject *)tb;
+}
+```
+
+在PyTraceBack_Here首先调用了PyErr_Fetch函数将tstate中所保存的当前异常信息传出，同时将tstate中所保存的当前异常信息抛弃．然后调用tb_create_raw创建了一个新的PyTraceback对象．
+
+在tb_create_raw中，首先进行了必要的检查，然后常见了一个新的PyTraceback对象．如果成功创建了新的PyTraceback对象，那么python会对其进行初始化的工作．在对此进行考察之前，我们首先看一下PyTraceback的内容究竟是什么．
+
+```C
+typedef struct _traceback {
+    PyObject_HEAD//python对象头
+    struct _traceback *tb_next;//指向前一个PyTraceback对象的指针
+    struct _frame *tb_frame;//指向触发异常的栈帧
+    int tb_lasti;//当前执行的最后一条字节码
+    int tb_lineno;//当前执行的最后一条字节码及其所对应的行号
+} PyTracebackObject;
+```
+
+首先，PyTraceback也是一个普通的python对象．其中的tb_next指针说明PyTraceback也跟frame对象一样，是一个链表结构．在tb_create_raw函数中，我们可以窥探到这个PyTraceback链表的构建过程．在这里tb->tb_next = next一句中的next正是通过PyErr_Fetch获取的从tstate中得到的PyTraceback对象．新建立的
+
+PyTraceback对象通过tb_frame指针与当前栈帧建立了关联，利用tb_lasti与tb_lineno保存了最后一条字节码及其行号信息．PyTraceback的初始化工作完成之后，执行流程回到PyTraceBack_Here中，在对返回的newtb进行检查之后，python再次调用了PyErr_Restore函数在tstate中保存了异常信息，不过现在的tstate->curexc_traceback已经是新的PyTraceback对象了．
+
