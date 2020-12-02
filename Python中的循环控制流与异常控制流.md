@@ -648,7 +648,7 @@ tb_create_raw(PyTracebackObject *next, PyFrameObject *frame, int lasti,
 
 在PyTraceBack_Here首先调用了PyErr_Fetch函数将tstate中所保存的当前异常信息传出，同时将tstate中所保存的当前异常信息抛弃．然后调用tb_create_raw创建了一个新的PyTraceback对象．
 
-在tb_create_raw中，首先进行了必要的检查，然后常见了一个新的PyTraceback对象．如果成功创建了新的PyTraceback对象，那么python会对其进行初始化的工作．在对此进行考察之前，我们首先看一下PyTraceback的内容究竟是什么．
+在tb_create_raw中，首先进行了必要的检查，然后创建了一个新的PyTraceback对象．如果成功创建了新的PyTraceback对象，那么python会对其进行初始化的工作．在对此进行考察之前，我们首先看一下PyTraceback的内容究竟是什么．
 
 ```C
 typedef struct _traceback {
@@ -664,3 +664,22 @@ typedef struct _traceback {
 
 PyTraceback对象通过tb_frame指针与当前栈帧建立了关联，利用tb_lasti与tb_lineno保存了最后一条字节码及其行号信息．PyTraceback的初始化工作完成之后，执行流程回到PyTraceBack_Here中，在对返回的newtb进行检查之后，python再次调用了PyErr_Restore函数在tstate中保存了异常信息，不过现在的tstate->curexc_traceback已经是新的PyTraceback对象了．
 
+PyTraceBack_Here执行完成之后，流程返回_PyEval_EvalFrameDefault中。tstate->c_tracefunc是用户自定义的追踪函数，主要用于编写python的debugger，通常都是NULL，我们可以不用理会。
+
+标签exception_unwind处是一个while循环，python通过这个循环实现了对try语句块的处理，此处暂且按下不表。我们假定f_iblock的值为0，那么直接跳过while循环，执行while循环之后的break语句。这条break语句的结果是python虚拟机的流程直接跳出了main_loop循环（包裹巨大switch结构的for循环），开始执行推退出流程。
+
+我们忽略一些次要的流程，来到标签exit_eval_frame处。在这里通过设置tstate中的活动栈帧，虚拟机完成了栈帧的回退动作。
+
+```C
+f->f_executing = 0;//frame对象中指示frame对象是否活动
+tstate->frame = f->f_back;//指向前一个栈帧的指针
+return _Py_CheckFunctionResult(NULL, retval, "PyEval_EvalFrameEx");//退出当前_PyEval_EvalFrameDefault
+```
+
+通过一个例子来说明pyhton中的栈帧展开过程。
+
+![image-20201202191251231](Python中的循环控制流与异常控制流.assets/image-20201202191251231.png)
+
+在函数h中发生了除零异常，由于我们并没有编写异常捕获的代码，所以python在tstate中存储了异常信息之后从h所对应的PyEval_EvalFrameDefault中退出。g和f的退出过程与h类似。最终，虚拟机的执行流程退出到交互式环境中并且打印出了异常信息。python虚拟机打印异常信息的来源，正是我们之前所叙述的栈帧展开过程中所建立PyTraceback链表。
+
+![image-20201202192616549](Python中的循环控制流与异常控制流.assets/image-20201202192616549.png)
