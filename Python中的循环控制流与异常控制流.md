@@ -315,7 +315,7 @@ def a():
 
 从字节码序列以及流程图中可以看出，while循环的循环机制，break与continue机制也是通过字节码中的跳转指令完成的，这与与if控制流的实现是类似的．
 
-### 异常控制流
+### 内建异常控制流
 
 程序运行过程中总会出现一些异常情况，比如除数为0，内存不足，想要打开的文件不存在等．一个健壮的程序必须处理这些异常情况．为此，现代编程语言中都引入了＂异常＂的概念来对程序运行过程中的突发情况进行抽象．python中提供try...except...finally来协助程序员进行异常处理．
 
@@ -683,3 +683,299 @@ return _Py_CheckFunctionResult(NULL, retval, "PyEval_EvalFrameEx");//退出当�
 在函数h中发生了除零异常，由于我们并没有编写异常捕获的代码，所以python在tstate中存储了异常信息之后从h所对应的PyEval_EvalFrameDefault中退出。g和f的退出过程与h类似。最终，虚拟机的执行流程退出到交互式环境中并且打印出了异常信息。python虚拟机打印异常信息的来源，正是我们之前所叙述的栈帧展开过程中所建立PyTraceback链表。
 
 ![image-20201202192616549](Python中的循环控制流与异常控制流.assets/image-20201202192616549.png)
+
+### 异常控制语义结构
+
+在前面我们讨论了python中内建的异常处理机制．然而，python也提供了现代化的异常控制语义．在这里，我们通过一个简单的例子来研究python
+
+所提供的异常控制结构如何影响python虚拟机的执行流程。
+
+```python
+try:
+  1           0 SETUP_FINALLY           60 (to 62)
+              2 SETUP_FINALLY           12 (to 16)
+	raise Exception("i am an exception")
+  2           4 LOAD_NAME                1 (Exception)
+              6 LOAD_CONST               1 ('i am an exception')
+              8 CALL_FUNCTION            1
+             10 RAISE_VARARGS            1
+             12 POP_BLOCK
+             14 JUMP_FORWARD            42 (to 58)
+except Exception as e:
+  3     >>   16 DUP_TOP
+             18 LOAD_NAME                1 (Exception)
+             20 COMPARE_OP              10 (exception match)
+             22 POP_JUMP_IF_FALSE       56
+             24 POP_TOP
+             26 STORE_NAME               2 (e)
+             28 POP_TOP
+             30 SETUP_FINALLY           12 (to 44)
+	print(e)
+  4          32 LOAD_NAME                0 (print)
+             34 LOAD_NAME                2 (e)
+             36 CALL_FUNCTION            1
+             38 POP_TOP
+             40 POP_BLOCK
+             42 BEGIN_FINALLY
+        >>   44 LOAD_CONST               2 (None)
+             46 STORE_NAME               2 (e)
+             48 DELETE_NAME              2 (e)
+             50 END_FINALLY
+             52 POP_EXCEPT
+             54 JUMP_FORWARD             2 (to 58)
+        >>   56 END_FINALLY
+        >>   58 POP_BLOCK
+             60 BEGIN_FINALLY
+finally:
+    print("the final code")
+  6     >>   62 LOAD_NAME                0 (print)
+             64 LOAD_CONST               0 ('the final code')
+             66 CALL_FUNCTION            1
+             68 POP_TOP
+             70 END_FINALLY
+             72 LOAD_CONST               2 (None)
+             74 RETURN_VALUE
+```
+
+首先给出异常处理中的关键数据结构PyTryBlock的定义
+
+```C
+typedef struct {
+    int b_type;                 /* what kind of block this is */
+    int b_handler;              /* where to jump to find handler */
+    int b_level;                /* value stack level to pop to */
+} PyTryBlock;
+```
+
+frame中与PyTryBlock相关的域
+
+```C
+#define CO_MAXBLOCKS 20 /* Max static block nesting within a function */
+typedef struct _frame {
+    /*...*/
+    int f_iblock;               /* index in f_blockstack */
+    /*...*/
+    PyTryBlock f_blockstack[CO_MAXBLOCKS]; /* for try and loop blocks */
+    /*...*/
+} PyFrameObject;
+```
+
+首先，我们来看一下字节码setup_finally。
+
+```C
+case TARGET(SETUP_FINALLY): {
+            /* NOTE: If you add any new block-setup opcodes that
+               are not try/except/finally handlers, you may need
+               to update the PyGen_NeedsFinalizing() function.
+               */
+
+            PyFrame_BlockSetup(f, SETUP_FINALLY, INSTR_OFFSET() + oparg,
+                               STACK_LEVEL());
+            DISPATCH();
+        }
+```
+
+函数PyFrame_BlockSetup、
+
+```c
+void
+PyFrame_BlockSetup(PyFrameObject *f, int type, int handler, int level)
+{
+    PyTryBlock *b;
+    if (f->f_iblock >= CO_MAXBLOCKS)
+        Py_FatalError("XXX block stack overflow");
+    b = &f->f_blockstack[f->f_iblock++];//增加block引用计数
+    b->b_type = type;//设置block类型
+    b->b_level = level;//设置堆栈深度
+    b->b_handler = handler;//设置跳转点
+}
+```
+
+执行了前两条字节码setup_finally之后的f_blockstack如下图所示
+
+![image-20201205110305331](Python中的循环控制流与异常控制流.assets/image-20201205110305331.png)
+
+在这里的两个PyTryBlock分别对应于finally语句以及except语句。在继续讨论之前，我们首先关注一下raise_varargs这条字节码。
+
+```C
+case TARGET(RAISE_VARARGS): {
+            PyObject *cause = NULL, *exc = NULL;
+            switch (oparg) {
+            case 2:
+                cause = POP(); /* cause */
+                /* fall through */
+            case 1:
+                exc = POP(); /* exc */
+                /* fall through */
+            case 0:
+                if (do_raise(exc, cause)) {
+                    goto exception_unwind;
+                }
+                break;
+            default:
+                PyErr_SetString(PyExc_SystemError,
+                           "bad RAISE_VARARGS oparg");
+                break;
+            }
+            goto error;
+        }
+```
+
+在raise_varargs执行之前，虚拟机通过load_name，load_const与call_function产生了一个异常对象并压入栈顶，raise_varargs的工作就是从把这个异常对象出栈时开始。此处raise_varargs的参数是1，所以直接将异常对象取出赋给exc，然后调用了do_raise函数。在do_raise中经过了一系列纷繁复杂的动作之后（包括将异常对象储存到当前线程状态对象tstate中），虚拟机通过goto语句转到了与内建异常处理时相同的位置。
+
+我们在讨论python的内建异常处理机制时曾经忽略了一个while循环，该循环是python实现的异常控制语义的关键。
+
+```C
+PyObject*
+_PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
+{
+main_loop:
+    for (;;) {
+        /*
+        ...
+        */
+exception_unwind:
+        /* Unwind stacks if an exception occurred */
+        while (f->f_iblock > 0) {
+            /* Pop the current block. */
+            PyTryBlock *b = &f->f_blockstack[--f->f_iblock];//取出TryBlock栈顶的TryBlock
+
+            if (b->b_type == EXCEPT_HANDLER) {//如果该异常已经处理过则不再处理
+                UNWIND_EXCEPT_HANDLER(b);
+                continue;
+            }
+            UNWIND_BLOCK(b);
+            if (b->b_type == SETUP_FINALLY) {//开始处理异常
+                PyObject *exc, *val, *tb;
+                int handler = b->b_handler;
+                _PyErr_StackItem *exc_info = tstate->exc_info;
+                /* Beware, this invalidates all b->b_* fields */
+                PyFrame_BlockSetup(f, EXCEPT_HANDLER, -1, STACK_LEVEL());//向TryBlock栈中压入一个类型为EXCEPT_HANDLER的TryBlock
+                PUSH(exc_info->exc_traceback);//exc_info中指向异常栈栈顶，这里将其内容入栈
+                PUSH(exc_info->exc_value);
+                if (exc_info->exc_type != NULL) {
+                    PUSH(exc_info->exc_type);
+                }
+                else {
+                    Py_INCREF(Py_None);
+                    PUSH(Py_None);
+                }
+                PyErr_Fetch(&exc, &val, &tb);//获取tstate中存储的正在被抛出的异常
+                /* Make the raw exception data
+                   available to the handler,
+                   so a program can emulate the
+                   Python main loop. */
+                PyErr_NormalizeException(
+                    &exc, &val, &tb);
+                if (tb != NULL)
+                    PyException_SetTraceback(val, tb);
+                else
+                    PyException_SetTraceback(val, Py_None);
+                Py_INCREF(exc);
+                exc_info->exc_type = exc;
+                Py_INCREF(val);
+                exc_info->exc_value = val;
+                exc_info->exc_traceback = tb;
+                if (tb == NULL)
+                    tb = Py_None;
+                Py_INCREF(tb);
+                PUSH(tb);//正在被抛出的异常的相关信息入栈
+                PUSH(val);
+                PUSH(exc);
+                JUMPTO(handler);//跳转
+                /* Resume normal execution */
+                goto main_loop;
+            }
+        } /* unwind stack */
+
+        /* End the loop as we still have an error */
+        break;
+    } /* main loop */
+    /*
+    ...
+    */
+}
+```
+
+在while循环中，首先就是取出TryBlock栈栈顶的TryBlock，如果该TryBlock的b_type为EXCEPT_HANDLER，表明该位置的TryBlock所对应的异常已经被处理了。否则就进入异常处理过程。在进行了必要的信息保存工作之后，流程来到了JUMPTO(handler)。handler中保存的是开始进行异常处理的字节码的地址，这里是（16 dup_top）。字节码（20 compare_op）进行了异常类型的比较，即比较被抛出的异常与所要捕获的一场是否为相同类型。如果相同则进行后续处理（print语句），否则跳转到偏移量为56的字节码指令。
+
+我们注意到，异常类型不同会比异常类型的情况多执行一条end_finally指令。
+
+end_finally指令的实现
+
+```c
+case TARGET(END_FINALLY): {
+            PREDICTED(END_FINALLY);
+            /* At the top of the stack are 1 or 6 values:
+               Either:
+                - TOP = NULL or an integer
+               or:
+                - (TOP, SECOND, THIRD) = exc_info()
+                - (FOURTH, FITH, SIXTH) = previous exception for EXCEPT_HANDLER
+            */
+            PyObject *exc = POP();
+            if (exc == NULL) {
+                FAST_DISPATCH();
+            }
+            else if (PyLong_CheckExact(exc)) {
+                int ret = _PyLong_AsInt(exc);
+                Py_DECREF(exc);
+                if (ret == -1 && PyErr_Occurred()) {
+                    goto error;
+                }
+                JUMPTO(ret);
+                FAST_DISPATCH();
+            }
+            else {
+                assert(PyExceptionClass_Check(exc));
+                PyObject *val = POP();
+                PyObject *tb = POP();
+                PyErr_Restore(exc, val, tb);
+                goto exception_unwind;
+            }
+        }
+```
+
+begin_finally指令的实现
+
+```C
+case TARGET(BEGIN_FINALLY): {
+            /* Push NULL onto the stack for using it in END_FINALLY,
+               POP_FINALLY, WITH_CLEANUP_START and WITH_CLEANUP_FINISH.
+             */
+            PUSH(NULL);
+            FAST_DISPATCH();
+        }
+```
+
+通过观察可以发现，多执行的end_finally指令是为了在异常不匹配时将去出来的异常信息重新放回到线程状态对象中，让python虚拟机内部重新进入发生异常的状态，寻找真正能处理异常的代码。而如果异常信息匹配异常处理顺利执行，那么虚拟机会执行begin_finally在栈顶设置一个NULL值，end_finally获取栈顶的NULL之后就会正常执行后续的字节码。
+
+虚拟机在正确处理一场之后还要恢复本次异常处理之前的异常信息。pop_except指令实现了异常信息的恢复。
+
+```C
+case TARGET(POP_EXCEPT): {
+            PyObject *type, *value, *traceback;
+            _PyErr_StackItem *exc_info;
+            PyTryBlock *b = PyFrame_BlockPop(f);
+            if (b->b_type != EXCEPT_HANDLER) {
+                PyErr_SetString(PyExc_SystemError,
+                                "popped block is not an except handler");
+                goto error;
+            }
+            assert(STACK_LEVEL() >= (b)->b_level + 3 &&
+                   STACK_LEVEL() <= (b)->b_level + 4);
+            exc_info = tstate->exc_info;
+            type = exc_info->exc_type;
+            value = exc_info->exc_value;
+            traceback = exc_info->exc_traceback;
+            exc_info->exc_type = POP();
+            exc_info->exc_value = POP();
+            exc_info->exc_traceback = POP();
+            Py_XDECREF(type);
+            Py_XDECREF(value);
+            Py_XDECREF(traceback);
+            DISPATCH();
+        }
+```
+
+pop_except的作用是从TryBlock栈中弹出一个Block。弹出的Block必须是EXCEPT_HANDLER类型的block。弹出之后，pop_except还要恢复在堆栈中保存的一场信息。
