@@ -914,7 +914,7 @@ case TARGET(END_FINALLY): {
                 - (FOURTH, FITH, SIXTH) = previous exception for EXCEPT_HANDLER
             */
             PyObject *exc = POP();
-            if (exc == NULL) {
+            if (exc == NULL) {//begin_finally压入栈顶的NULL
                 FAST_DISPATCH();
             }
             else if (PyLong_CheckExact(exc)) {
@@ -926,7 +926,7 @@ case TARGET(END_FINALLY): {
                 JUMPTO(ret);
                 FAST_DISPATCH();
             }
-            else {
+            else {//恢复异常信息
                 assert(PyExceptionClass_Check(exc));
                 PyObject *val = POP();
                 PyObject *tb = POP();
