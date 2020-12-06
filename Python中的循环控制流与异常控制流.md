@@ -978,4 +978,4 @@ case TARGET(POP_EXCEPT): {
         }
 ```
 
-pop_except的作用是从TryBlock栈中弹出一个Block。弹出的Block必须是EXCEPT_HANDLER类型的block。弹出之后，pop_except还要恢复在堆栈中保存的一场信息。
+pop_except的作用是从TryBlock栈中弹出一个Block。弹出的Block必须是EXCEPT_HANDLER类型的block。弹出之后，pop_except还要恢复在堆栈中保存的异常信息。
