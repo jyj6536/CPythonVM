@@ -789,7 +789,7 @@ case TARGET(STORE_NAME): {
         }
 ```
 
-f_locals是一个可映射对象．在这里虚拟机首先从names(f->code->co_names)中找到oparg作为下标所对应的元素name，然后将栈顶的值v弹出，在f_locals中建立一个name与v的对应关系．
+f_locals是一个可映射对象．在这里虚拟机首先从names(f->code->co_names)中找到oparg作为下标所对应的元素name，然后将栈顶的值v弹出，在f_locals中建立一个name与v的对应关系。
 
 #### **build_list**
 
