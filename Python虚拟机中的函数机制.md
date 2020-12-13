@@ -198,23 +198,43 @@ call_function指令的主要工作都是在call_function中完成的。
 
 ~~~C
 Py_LOCAL_INLINE(PyObject *) _Py_HOT_FUNCTION
-call_function(PyThreadState *tstate, PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
+call_function(PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
 {
-    PyObject **pfunc = (*pp_stack) - oparg - 1;//获取函数对象指针（字节码参数oparg为0，栈顶就是函数对象的指针）
-    PyObject *func = *pfunc;//函数对象
+    PyObject **pfunc = (*pp_stack) - oparg - 1;//获取func对象
+    PyObject *func = *pfunc;//func对象
     PyObject *x, *w;
     Py_ssize_t nkwargs = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
-    Py_ssize_t nargs = oparg - nkwargs;//kwnames为NULL，所以nargs就是总的参数个数
-    PyObject **stack = (*pp_stack) - nargs - nkwargs;//弹出所有参数
+    Py_ssize_t nargs = oparg - nkwargs;//参数总数
+    PyObject **stack = (*pp_stack) - nargs - nkwargs;//参数出栈
 
-    if (tstate->use_tracing) {
-        x = trace_call_function(tstate, func, stack, nargs, kwnames);
+    /* Always dispatch PyCFunction first, because these are
+       presumed to be the most frequent callable object.
+    */
+    if (PyCFunction_Check(func)) {//CFunction在这里执行
+        PyThreadState *tstate = _PyThreadState_GET();
+        C_TRACE(x, _PyCFunction_FastCallKeywords(func, stack, nargs, kwnames));
+    }
+    else if (Py_TYPE(func) == &PyMethodDescr_Type) {//执行method_descriptor（比如str.upper）
+        /*...*/
     }
     else {
-        x = _PyObject_Vectorcall(func, stack, nargs | PY_VECTORCALL_ARGUMENTS_OFFSET, kwnames);
+        if (PyMethod_Check(func) && PyMethod_GET_SELF(func) != NULL) {
+            /*...*///处理bound method
+        }
+        else {
+            Py_INCREF(func);
+        }
+
+        if (PyFunction_Check(func)) {//[A]在这里开始执行用户自定义的函数
+            x = _PyFunction_FastCallKeywords(func, stack, nargs, kwnames);
+        }
+        else {
+            x = _PyObject_FastCallKeywords(func, stack, nargs, kwnames);
+        }
+        Py_DECREF(func);
     }
 
-    assert((x != NULL) ^ (_PyErr_Occurred(tstate) != NULL));
+    assert((x != NULL) ^ (PyErr_Occurred() != NULL));
 
     /* Clear the stack of the function object. */
     while ((*pp_stack) > pfunc) {
@@ -226,3 +246,120 @@ call_function(PyThreadState *tstate, PyObject ***pp_stack, Py_ssize_t oparg, PyO
 }
 ~~~
 
+在call_function函数中有多条分支分别处置不同类型的函数调用。用户自定义函数在标记[A]处的到了处理。
+
+~~~C
+PyObject *
+_PyFunction_FastCallKeywords(PyObject *func, PyObject *const *stack,
+                             Py_ssize_t nargs, PyObject *kwnames)
+{
+    /*必要的处理以及检查工作*/
+    /* kwnames must only contains str strings, no subclass, and all keys must
+       be unique */
+
+    if (co->co_kwonlyargcount == 0 && nkwargs == 0 &&//[A]快速通道————函数声明中不包含强制关键字参数且未传入关键字参数
+        (co->co_flags & ~PyCF_MASK) == (CO_OPTIMIZED | CO_NEWLOCALS | CO_NOFREE))//CO_NOFREE：没有free和cell变量
+    {
+        if (argdefs == NULL && co->co_argcount == nargs) {//所有参数都已经赋值：nargs——调用时传入的参数个数;co->co_argcount函数声明的参数个数（不包括强制关键字参数，*args以及**kw所声明的参数;*args所代表的参数数量也会被计算入nargs，如果有*args参数，函数流程不会进入这个分支）。
+            return function_code_fastcall(co, stack, nargs, globals);
+        }
+        else if (nargs == 0 && argdefs != NULL
+                 && co->co_argcount == PyTuple_GET_SIZE(argdefs)) {//调用时未传参数但是所有参数都具有默认值
+            /* function called with no arguments, but all parameters have
+               a default value: use default values as arguments .*/
+            stack = _PyTuple_ITEMS(argdefs);//使用默认值作为参数值
+            return function_code_fastcall(co, stack, PyTuple_GET_SIZE(argdefs),
+                                          globals);
+        }
+    }
+    //[B]不满足以上的分支条件则进入常规通道
+    kwdefs = PyFunction_GET_KW_DEFAULTS(func);
+    closure = PyFunction_GET_CLOSURE(func);
+    name = ((PyFunctionObject *)func) -> func_name;
+    qualname = ((PyFunctionObject *)func) -> func_qualname;
+
+    if (argdefs != NULL) {
+        d = _PyTuple_ITEMS(argdefs);
+        nd = PyTuple_GET_SIZE(argdefs);
+    }
+    else {
+        d = NULL;
+        nd = 0;
+    }
+    return _PyEval_EvalCodeWithName((PyObject*)co, globals, (PyObject *)NULL,
+                                    stack, nargs,
+                                    nkwargs ? _PyTuple_ITEMS(kwnames) : NULL,
+                                    stack + nargs,
+                                    nkwargs, 1,
+                                    d, (int)nd, kwdefs,
+                                    closure, name, qualname);
+}
+~~~
+
+可以看到，_PyFunction_FastCallKeywords的执行流程包括两个分支：标签[A]处的快速通道;标签[B]处的常规通道。快速通道与常规通道的区别在于快速通道中处理的参数类型比较简单，而常规通道对python中各种复杂的参数情况都进行了处理。
+
+我们首先来看快速通道的后续流程。
+
+~~~C
+static PyObject* _Py_HOT_FUNCTION
+function_code_fastcall(PyCodeObject *co, PyObject *const *args, Py_ssize_t nargs,
+                       PyObject *globals)
+{
+    /*...*/
+    f = _PyFrame_New_NoTrack(tstate, co, globals, NULL);//创建栈帧
+    /*...*/
+    result = PyEval_EvalFrameEx(f,0);//执行f
+
+    /*...*/
+    return result;
+}
+~~~
+
+在function_code_fastcall中首先创建了一个frame对象，然后调用了PyEval_EvalFrameEx函数，继续对PyEval_EvalFrameEx进行追溯
+
+```C
+PyObject *
+PyEval_EvalFrameEx(PyFrameObject *f, int throwflag)
+{
+    PyInterpreterState *interp = _PyInterpreterState_GET_UNSAFE();
+    return interp->eval_frame(f, throwflag);
+}
+#define _PyInterpreterState_GET_UNSAFE() (_PyThreadState_GET()->interp)
+```
+
+变量interp是当前线程状态tstate的一个成员，找到他的定义
+
+```C
+typedef struct _is {
+
+    /*...*/
+    /* Initialized to PyEval_EvalFrameDefault(). */
+    _PyFrameEvalFunction eval_frame;
+
+    /*...*/
+} PyInterpreterState;
+typedef PyObject* (*_PyFrameEvalFunction)(struct _frame *, int);
+```
+
+找到他的初始化函数
+
+```C
+PyInterpreterState *
+PyInterpreterState_New(void)
+{
+    PyInterpreterState *interp = (PyInterpreterState *)
+                                 PyMem_RawMalloc(sizeof(PyInterpreterState));
+
+    if (interp == NULL) {
+        return NULL;
+    }
+
+    /*...*/
+    interp->eval_frame = _PyEval_EvalFrameDefault;
+    /*...*/
+
+    return interp;
+}
+```
+
+最终，我们发现interp->eval_frame这个函数指针指向的就是_PyEval_EvalFrameDefault。

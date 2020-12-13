@@ -68,7 +68,7 @@ co_freevars ('k', 'x')
 co_cellvars ()
 ```
 
-**co_argcount**：Code Block中位置参数的个数．示例中只有x与y两个位置参数．
+**co_argcount**：当前函数接受的参数个数，不包括强制关键字参数，*args，**kwargs。
 
 **co_kwonlyargcount**：强制关键字参数的个数．强制关键字参数必须具名赋值（key=x）或者具有默认值（如本例中的z=3）．强制关键字参数位于*之后（如本例或者\*,key=x）.
 
