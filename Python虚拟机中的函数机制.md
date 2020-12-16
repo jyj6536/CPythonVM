@@ -7,16 +7,16 @@ typedef struct {
     PyObject_HEAD
     PyObject *func_code;        /* A code object, the __code__ attribute *///对应编译后的PyCodeObject对象
     PyObject *func_globals;     /* A dictionary (other mappings won't do) *///函数运行时的globals名字空间
-    PyObject *func_defaults;    /* NULL or a tuple *///默认参数
-    PyObject *func_kwdefaults;  /* NULL or a dict *///关键字参数
-    PyObject *func_closure;     /* NULL or a tuple of cell objects *///用于实现闭包
+    PyObject *func_defaults;    /* NULL or a tuple *///一个元组，储存了函数所有的默认参数
+    PyObject *func_kwdefaults;  /* NULL or a dict *///保存指定了默认值的强制关键字参数的默认值
+    PyObject *func_closure;     /* NULL or a tuple of cell objects *///一个元组，保存了当前函数的所有闭包层级
     PyObject *func_doc;         /* The __doc__ attribute, can be anything *///函数的文档
     PyObject *func_name;        /* The __name__ attribute, a string object *///函数__name__属性
     PyObject *func_dict;        /* The __dict__ attribute, a dict or NULL *///函数的__dict__属性
     PyObject *func_weakreflist; /* List of weak references */
-    PyObject *func_module;      /* The __module__ attribute, can be anything *///函数的__module__属性
-    PyObject *func_annotations; /* Annotations, a dict or NULL */
-    PyObject *func_qualname;    /* The qualified name */
+    PyObject *func_module;      /* The __module__ attribute, can be anything *///函数的__module__属性，该函数所属的或者所关联的模块
+    PyObject *func_annotations; /* Annotations, a dict or NULL *///对参数的注释
+    PyObject *func_qualname;    /* The qualified name *///包含了该函数所属的层次结构及函数名的字符串
 
     /* Invariant:
      *     func_closure contains the bindings for func_code->co_freevars, so
@@ -298,6 +298,8 @@ _PyFunction_FastCallKeywords(PyObject *func, PyObject *const *stack,
 
 可以看到，_PyFunction_FastCallKeywords的执行流程包括两个分支：标签[A]处的快速通道;标签[B]处的常规通道。快速通道与常规通道的区别在于快速通道中处理的参数类型比较简单，而常规通道对python中各种复杂的参数情况都进行了处理。
 
+#### 快速通道
+
 我们首先来看快速通道的后续流程。
 
 ~~~C
@@ -363,3 +365,197 @@ PyInterpreterState_New(void)
 ```
 
 最终，我们发现interp->eval_frame这个函数指针指向的就是_PyEval_EvalFrameDefault。
+
+#### 常规通道
+
+在常规通道中最终调用了_PyEval_EvalCodeWithName函数。\_PyEval_EvalCodeWithName函数比较复杂，我们来看一下他的部分代码。
+
+~~~C
+PyObject *
+_PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,
+           PyObject *const *args, Py_ssize_t argcount,
+           PyObject *const *kwnames, PyObject *const *kwargs,
+           Py_ssize_t kwcount, int kwstep,
+           PyObject *const *defs, Py_ssize_t defcount,
+           PyObject *kwdefs, PyObject *closure,
+           PyObject *name, PyObject *qualname)
+{
+    /*...*/
+
+    /* Create the frame */
+    tstate = _PyThreadState_GET();
+    assert(tstate != NULL);
+    f = _PyFrame_New_NoTrack(tstate, co, globals, locals);//创建新frame对象
+    /*...*/
+
+    retval = PyEval_EvalFrameEx(f,0);//[A]执行frame对象f
+
+	/*...*/
+    return retval;
+}
+~~~
+
+标签[A]处再次执行了PyEval_EvalFrameEx函数，从这里开始与快速通道一致，python虚拟机流程最终进入了_PyEval_EvalFrameDefault函数，开始了真正的“函数调用”状态。上述过程就是对x86平台函数调用过程的模拟——创建新栈帧并在新栈帧中执行代码。当流程进入虚拟机的主循环时，func对象的影响已经消失了。func对象中真正对新栈帧产生影响的是code对象和global名字空间。这也就是说，func对象的实际作用就是一个”传送工具“——对字节码指令和global名字空间进行打包传送的一种方式。
+
+### 函数参数
+
+pyhton中的函数支持丰富的参数类型。
+
++ 位置参数——最普通的参数类型，def func(a)中的a就是一个位置参数；
++ 默认参数——具有默认值的位置参数，def func(a,b=2)中的b就是一个默认参数；
++ 可变参数——可以理解为可以接收可变数量的位置参数的参数，def func(a,b,*args)中的args就是一个可变参数，当a、b分别接收对应的位置上的参数之后如果还有剩余的参数则会被args接收；
++ 关键字参数——以键值对的形式传入的参数，def func(a,b,**kw)中的kw就是一个关键字参数，kw可以接收以任意数量传入的键值对形式传入的参数，在函数中这戏参数会被组装为一个dict；
++ 强制关键字参数——关键字参数可以传入任意键名的参数，为了对键名进行限制可以采用强制关键字参数，def func(a,b,*,k1,k2=v2)或者def func(a,b,\*args,k1,k2=v2)（args是可变参数）两种方式都可以定义强制关键字参数，对强制关键字参数进行赋值时必须采用“k=v”的方式进行，强制关键字参数可以有默认值，没有默认值的强制关键字参数必须显式赋值。
+
+#### 位置参数
+
+##### 位置参数的传递
+
+~~~python
+##test.py
+def func(a,b):
+    a = a+1
+    print(b)
+func(1,"age")
+##test.py的编译结果
+  1           0 LOAD_CONST               0 (<code object func at 0x000001CAC2BB0190, file ".\test.py", line 1>)
+              2 LOAD_CONST               1 ('func')
+              4 MAKE_FUNCTION            0
+              6 STORE_NAME               0 (func)
+
+  4           8 LOAD_NAME                0 (func)
+             10 LOAD_CONST               2 (1)
+             12 LOAD_CONST               3 ('age')
+             14 CALL_FUNCTION            2
+             16 POP_TOP
+             18 LOAD_CONST               4 (None)
+             20 RETURN_VALUE
+
+Disassembly of <code object func at 0x000001CAC2BB0190, file ".\test.py", line 1>:
+  2           0 LOAD_FAST                0 (a)
+              2 LOAD_CONST               1 (1)
+              4 BINARY_ADD
+              6 STORE_FAST               0 (a)
+
+  3           8 LOAD_GLOBAL              0 (print)
+             10 LOAD_FAST                1 (b)
+             12 CALL_FUNCTION            1
+             14 POP_TOP
+             16 LOAD_CONST               0 (None)
+             18 RETURN_VALUE
+~~~
+
+从编译后的代码可以看到，call_function指令之前有三条load指令这三条指令执行之后的运行时栈如图所示
+
+![image-20201216200450165](Python虚拟机中的函数机制.assets/image-20201216200450165.png)
+
+可以看到，func函数需要的参数都已经压入运行时堆栈了，接下来的call_function指令参数为2。
+
+~~~C
+Py_LOCAL_INLINE(PyObject *) _Py_HOT_FUNCTION
+call_function(PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
+{												//oparg = 2
+    PyObject **pfunc = (*pp_stack) - oparg - 1;	//pfunc指向栈顶的func对象
+    PyObject *func = *pfunc;
+    PyObject *x, *w;
+    Py_ssize_t nkwargs = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);	//kwnames = 0
+    Py_ssize_t nargs = oparg - nkwargs;										//nargs = 0
+    PyObject **stack = (*pp_stack) - nargs - nkwargs;						//stack指向参数弹出之后的位置（1所在的位置）
+
+  /*...*/
+        if (PyFunction_Check(func)) {//执行到这里
+            x = _PyFunction_FastCallKeywords(func, stack, nargs, kwnames);
+        }
+
+    /*...*/
+
+    return x;
+}
+//继续追踪_PyFunction_FastCallKeywords
+PyObject *					//函数对象func，栈顶指针，nargs = 2，kwnames = NULL
+_PyFunction_FastCallKeywords(PyObject *func, PyObject *const *stack,
+                             Py_ssize_t nargs, PyObject *kwnames)
+{
+    PyCodeObject *co = (PyCodeObject *)PyFunction_GET_CODE(func);
+    PyObject *globals = PyFunction_GET_GLOBALS(func);
+    PyObject *argdefs = PyFunction_GET_DEFAULTS(func);
+    PyObject *kwdefs, *closure, *name, *qualname;
+    PyObject **d;
+    Py_ssize_t nkwargs = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
+    Py_ssize_t nd;
+
+    /*...*/
+    /* kwnames must only contains str strings, no subclass, and all keys must
+       be unique */
+
+    /*...*/
+        if (argdefs == NULL && co->co_argcount == nargs) {
+            return function_code_fastcall(co, stack, nargs, globals);//执行到这里
+        }
+	/*...*/
+}
+//继续追溯function_code_fastcall
+static PyObject* _Py_HOT_FUNCTION        //args的值即是之前的stack参数的值
+function_code_fastcall(PyCodeObject *co, PyObject *const *args, Py_ssize_t nargs,
+                       PyObject *globals)
+{
+    PyFrameObject *f;
+    PyThreadState *tstate = _PyThreadState_GET();
+    PyObject **fastlocals;
+    Py_ssize_t i;
+    PyObject *result;
+	/*...*/
+    f = _PyFrame_New_NoTrack(tstate, co, globals, NULL);
+    if (f == NULL) {
+        return NULL;
+    }
+
+    fastlocals = f->f_localsplus;
+
+    for (i = 0; i < nargs; i++) {//[A]
+        Py_INCREF(*args);
+        fastlocals[i] = *args++;
+    }
+    result = PyEval_EvalFrameEx(f,0);
+    /*...*/
+}
+~~~
+
+随着对python虚拟机执行过程的一步步追溯，我们在function_code_fastcall中发现了熟悉的frame对象以及f_localsplus这个frame的成员。参数args的值就是之前call_function中stack的值。
+
+![image-20201216203307113](Python虚拟机中的函数机制.assets/image-20201216203307113.png)
+
+标签[A]处的for对新建栈帧的f_localsplus进行了循环赋值的操作，f->f_localsplus[0]、f->f_localsplus[1]分别被赋值为对象1、对象"age"。根据之前《Python虚拟机框架》中对frame对象结构的描述可知，f_localsplus是由两部分空间组成的——locals变量空间和运行时栈空间，函数参数也是一种局部变量，所以在这里func的参数a、b被存储到f_localsplus的起始位置与我们之前对frame对象的考察时完全符合的。
+
+##### 位置参数的访问
+
+当函数参数存储完成之后就进入了执行阶段。首先映入眼帘的就是一条load_fast指令。
+
+~~~C
+case TARGET(LOAD_FAST): {
+            PyObject *value = GETLOCAL(oparg);
+            if (value == NULL) {
+                format_exc_check_arg(PyExc_UnboundLocalError,
+                                     UNBOUNDLOCAL_ERROR_MSG,
+                                     PyTuple_GetItem(co->co_varnames, oparg));
+                goto error;
+            }
+            Py_INCREF(value);
+            PUSH(value);
+            FAST_DISPATCH();
+        }
+#define GETLOCAL(i)     (fastlocals[i])
+~~~
+
+load_fast指令是以f_localsplus这片内存为操作对象的指令。load_fast 0这条指令的作用就是将f_localsplus下标为0处的对象压入运行时堆栈，store_fast也类似，只不过是操作方向相反。
+
+~~~c
+case TARGET(STORE_FAST): {
+            PREDICTED(STORE_FAST);
+            PyObject *value = POP();
+            SETLOCAL(oparg, value);
+            FAST_DISPATCH();
+        }
+~~~
+
+到这里，我们对pyhton中是如何传递位置参数，以及在函数调用过程中是如何访问位置参数，都已经有了比较清晰的了解。在调用函数时，python虚拟机将函数参数从左到右压入运行时堆栈，在function_code_fastcall中，虚拟机又将这些参数依次拷贝到与函数对应的frame对象的f_localsplus域中。在访问这些参数时，python虚拟机并没有去查找名字空间，而是通过load_fast、store_fast指令借助偏移量来访问f_localsplus所存储的对象。这种通过索引来访问参数的方法正是“位置参数”名称的由来。

@@ -897,7 +897,7 @@ exception_unwind:
 }
 ```
 
-在while循环中，首先就是取出TryBlock栈栈顶的TryBlock，如果该TryBlock的b_type为EXCEPT_HANDLER，表明该位置的TryBlock所对应的异常已经被处理了。否则就进入异常处理过程。在进行了必要的信息保存工作之后，流程来到了JUMPTO(handler)。handler中保存的是开始进行异常处理的字节码的地址，这里是（16 dup_top）。字节码（20 compare_op）进行了异常类型的比较，即比较被抛出的异常与所要捕获的一场是否为相同类型。如果相同则进行后续处理（print语句），否则跳转到偏移量为56的字节码指令。
+在while循环中，首先就是取出TryBlock栈栈顶的TryBlock，如果该TryBlock的b_type为EXCEPT_HANDLER，表明该位置的TryBlock所对应的异常已经被处理了。否则就进入异常处理过程。在进行了必要的信息保存工作之后，流程来到了JUMPTO(handler)。handler中保存的是开始进行异常处理的字节码的地址，这里是（16 dup_top）。字节码（20 compare_op）进行了异常类型的比较，即比较被抛出的异常与所要捕获的异常是否为相同类型。如果相同则进行后续处理（print语句），否则跳转到偏移量为56的字节码指令。
 
 我们注意到，异常类型不同会比异常类型的情况多执行一条end_finally指令。
 
@@ -950,7 +950,7 @@ case TARGET(BEGIN_FINALLY): {
 
 通过观察可以发现，多执行的end_finally指令是为了在异常不匹配时将去出来的异常信息重新放回到线程状态对象中，让python虚拟机内部重新进入发生异常的状态，寻找真正能处理异常的代码。而如果异常信息匹配异常处理顺利执行，那么虚拟机会执行begin_finally在栈顶设置一个NULL值，end_finally获取栈顶的NULL之后就会正常执行后续的字节码。
 
-虚拟机在正确处理一场之后还要恢复本次异常处理之前的异常信息。pop_except指令实现了异常信息的恢复。
+虚拟机在正确处理异常之后还要恢复本次异常处理之前的异常信息。pop_except指令实现了异常信息的恢复。
 
 ```C
 case TARGET(POP_EXCEPT): {
