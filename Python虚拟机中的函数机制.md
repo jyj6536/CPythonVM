@@ -541,7 +541,7 @@ case TARGET(LOAD_FAST): {
                 goto error;
             }
             Py_INCREF(value);
-            PUSH(value);
+            PUSH(value);//获取fastlocals
             FAST_DISPATCH();
         }
 #define GETLOCAL(i)     (fastlocals[i])
@@ -553,9 +553,12 @@ load_fast指令是以f_localsplus这片内存为操作对象的指令。load_fas
 case TARGET(STORE_FAST): {
             PREDICTED(STORE_FAST);
             PyObject *value = POP();
-            SETLOCAL(oparg, value);
+            SETLOCAL(oparg, value);//设置fastlocals
             FAST_DISPATCH();
         }
+#define SETLOCAL(i, value)      do { PyObject *tmp = GETLOCAL(i); \
+                                     GETLOCAL(i) = value; \
+                                     Py_XDECREF(tmp); } while (0)
 ~~~
 
 到这里，我们对pyhton中是如何传递位置参数，以及在函数调用过程中是如何访问位置参数，都已经有了比较清晰的了解。在调用函数时，python虚拟机将函数参数从左到右压入运行时堆栈，在function_code_fastcall中，虚拟机又将这些参数依次拷贝到与函数对应的frame对象的f_localsplus域中。在访问这些参数时，python虚拟机并没有去查找名字空间，而是通过load_fast、store_fast指令借助偏移量来访问f_localsplus所存储的对象。这种通过索引来访问参数的方法正是“位置参数”名称的由来。
