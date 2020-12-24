@@ -562,3 +562,250 @@ case TARGET(STORE_FAST): {
 ~~~
 
 到这里，我们对pyhton中是如何传递位置参数，以及在函数调用过程中是如何访问位置参数，都已经有了比较清晰的了解。在调用函数时，python虚拟机将函数参数从左到右压入运行时堆栈，在function_code_fastcall中，虚拟机又将这些参数依次拷贝到与函数对应的frame对象的f_localsplus域中。在访问这些参数时，python虚拟机并没有去查找名字空间，而是通过load_fast、store_fast指令借助偏移量来访问f_localsplus所存储的对象。这种通过索引来访问参数的方法正是“位置参数”名称的由来。
+
+#### 默认参数
+
+##### 默认参数的储存
+
+在python中，允许位置参数具有默认值。具有默认值的位置参数与普通的位置参数具有不同的实现机制。在这里，我们深入考察具有默认值的位置参数的实现机制。
+
+~~~python
+def func(a=1,b=2):
+    print(a+b)
+func()
+func(b=3)
+#test.py的编译结果
+  1           0 LOAD_CONST               7 ((1, 2))
+              2 LOAD_CONST               2 (<code object func at 0x00000201728BFDF0, file ".\test.py", line 1>)
+              4 LOAD_CONST               3 ('func')
+              6 MAKE_FUNCTION            1 (defaults)
+              8 STORE_NAME               0 (func)
+
+  3          10 LOAD_NAME                0 (func)
+             12 CALL_FUNCTION            0
+             14 POP_TOP
+
+  4          16 LOAD_NAME                0 (func)
+             18 LOAD_CONST               4 (3)
+             20 LOAD_CONST               5 (('b',))
+             22 CALL_FUNCTION_KW         1
+             24 POP_TOP
+             26 LOAD_CONST               6 (None)
+             28 RETURN_VALUE
+
+Disassembly of <code object func at 0x00000201728BFDF0, file ".\test.py", line 1>:
+  2           0 LOAD_GLOBAL              0 (print)
+              2 LOAD_FAST                0 (a)
+              4 LOAD_FAST                1 (b)
+              6 BINARY_ADD
+              8 CALL_FUNCTION            1
+             10 POP_TOP
+             12 LOAD_CONST               0 (None)
+             14 RETURN_VALUE
+~~~
+
+通过观察func所对应的字节码我们可以发现，虽然参数a、b具有默认值，但是函数中对a、b的访问仍然是通过位置参数访问指令实现的。也就是说，是否具有默认值不会对位置参数在函数内部的访问方式产生影响。那么，默认参数的玄机到底体现在哪里？通过观察make_function函数的参数，我们可以从中发现一些端倪。
+
+在参数具有默认值的情况下，make_function的参数为1，而没有默认值时无论有没有参数make_function的参数都是0。再次查看make_function字节码的部分实现。
+
+~~~C
+//////////////////////////////////////////////////////
+            if (oparg & 0x08) {                     //
+                assert(PyTuple_CheckExact(TOP()));	//
+                func ->func_closure = POP();		//
+            }										//
+            if (oparg & 0x04) {						//
+                assert(PyDict_CheckExact(TOP()));	//
+                func->func_annotations = POP();		//
+            }										///*参数处理*/
+            if (oparg & 0x02) {						//
+                assert(PyDict_CheckExact(TOP()));	//
+                func->func_kwdefaults = POP();		//
+            }										//
+            if (oparg & 0x01) {						///*oparg为1，执行该分支*/
+                assert(PyTuple_CheckExact(TOP()));	//
+                func->func_defaults = POP();		///[A]
+            }										//
+//////////////////////////////////////////////////////
+~~~
+
+在执行字节码make_function之前，虚拟机执行了三条load_const分别将一个tuple对象((1,2)，存储参数a与b的默认值)，func所对应的code对象以及unicode对象（func的qualname）压入堆栈，当执行到标签[A]处时，code对象与unicode对象已经出栈，此时出栈的就是最先入栈的tuple对象，所以最终返回的func对象func_defaults指向的就是这个tuple对象。通过这样一些列的操作，func的默认值与func对象成功绑定到了一起。
+
+##### func的第一次调用
+
+首先，我们来看函数func的第一次访问call_function 0。
+
+重新追溯字节码call_function的执行过程，我们发现了针对不传参数但是所有参数都具有默认值的情况的处理。
+
+~~~C
+PyObject *
+_PyFunction_FastCallKeywords(PyObject *func, PyObject *const *stack,
+                             Py_ssize_t nargs, PyObject *kwnames)
+{
+    PyObject *argdefs = PyFunction_GET_DEFAULTS(func);
+    /*必要的处理以及检查工作*/
+    /* kwnames must only contains str strings, no subclass, and all keys must
+       be unique */
+
+   /*...*/
+        else if (nargs == 0 && argdefs != NULL
+                 && co->co_argcount == PyTuple_GET_SIZE(argdefs)) {//调用时未传参数但是所有参数都具有默认值
+            /* function called with no arguments, but all parameters have
+               a default value: use default values as arguments .*/
+            stack = _PyTuple_ITEMS(argdefs);//使用默认值作为参数值
+            return function_code_fastcall(co, stack, PyTuple_GET_SIZE(argdefs),
+                                          globals);
+        }
+    }
+    //[B]不满足以上的分支条件则进入常规通道
+    /*...*/
+}
+~~~
+
+查看_PyTuple_ITEMS的定义
+
+~~~C
+#define _PyTuple_ITEMS(op) (_PyTuple_CAST(op)->ob_item)
+~~~
+
+在这里，argdefs指向的时func对象的func_defaults域，也就是存储func对象默认参数值的tuple。结合tuple对象的内存布局我们可以知道，此处的stack指针指向的就是tuple中存储元素的内存区域。这就意味着tuple中的元素被作为参数传递给了function_code_fastcall。之后虚拟机中的执行流程就与普通位置参数的执行流程一致了。
+
+##### func的第二次调用
+
+首先，我们来看一下执行func之前的运行时堆栈情况。
+
+![image-20201221174058157](Python虚拟机中的函数机制.assets/image-20201221174058157.png)
+
+在func的第二次调用中，我们给b赋了一个指定值3。从编译得到的字节码中可以发现，此时对func的调用已经不是通过call_function，而是通过call_function_kw。
+
+~~~C
+case TARGET(CALL_FUNCTION_KW): {
+            PyObject **sp, *res, *names;
+
+            names = POP();
+            assert(PyTuple_CheckExact(names) && PyTuple_GET_SIZE(names) <= oparg);
+            sp = stack_pointer;
+            res = call_function(&sp, oparg, names);
+            stack_pointer = sp;
+            PUSH(res);
+            Py_DECREF(names);
+
+            if (res == NULL) {
+                goto error;
+            }
+            DISPATCH();
+        }
+~~~
+
+与字节码call_function相比，call_fucntion_kw中调用call_function函数时所传的第三个参数不再是NULL，而是栈顶的tuple对象。同时，oparg的值为1。我们带着这些信息重新考察call_function函数。
+
+~~~C
+Py_LOCAL_INLINE(PyObject *) _Py_HOT_FUNCTION
+call_function(PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
+{
+    PyObject **pfunc = (*pp_stack) - oparg - 1;
+    PyObject *func = *pfunc;
+    PyObject *x, *w;
+    Py_ssize_t nkwargs = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
+    Py_ssize_t nargs = oparg - nkwargs;
+    PyObject **stack = (*pp_stack) - nargs - nkwargs;
+	/*...*/
+~~~
+
+![image-20201221180955838](Python虚拟机中的函数机制.assets/image-20201221180955838.png)
+
+初始化后的各个变量的值如上图所示。
+
+继续进行追溯，找到\_PyEval_EvalCodeWithName函数。\_PyEval_EvalCodeWithNam函数是一个综合应对python中不同情况参数的函数，在这里我们将与本节讨论相关的部分截取出来。
+
+~~~C
+PyObject *
+_PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,//func对象对应的code对象，func对象的全局名字空间，func对象的本地名字空间
+           PyObject *const *args, Py_ssize_t argcount,//上图中的stack，上图中的nargs（0）
+           PyObject *const *kwnames, PyObject *const *kwargs,//上图中的names（一个tuple对象）的元素域，上图中的stack
+           Py_ssize_t kwcount, int kwstep,//nkwargs，1
+           PyObject *const *defs, Py_ssize_t defcount,//func的func_defaults域(一个tuple对象)的元素域，元素域的元素数
+           PyObject *kwdefs, PyObject *closure,//func的func_kwdefaults域（储存了具有默认值的强制关键字参数的默认值），闭包
+           PyObject *name, PyObject *qualname)//函数的name以及qualname
+{
+    /*...*/
+    const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount;
+    
+    /* Copy positional arguments into local variables */
+    if (argcount > co->co_argcount) {//在这里，argcount代表函数调用时按位置传入的位置函数参数个数，co_argcount代表函数声明中的位置参数个数；本例中argcount为0是因为调用时未采用按位置传入的形式传入位置参数，如果调用形式为func(2,b=3)，那么此处的argcount为1，同时args[0]存放long对象2，后续的for循环就会调用SETLOCAL宏对frame对象的fastlocals[0]进行赋值从而实现局部变量a的初始化
+        n = co->co_argcount;
+    }
+    else {
+        n = argcount;
+    }
+    for (i = 0; i < n; i++) {
+        x = args[i];
+        Py_INCREF(x);
+        SETLOCAL(i, x);
+    }
+    
+    /*...*/
+    
+    /* Handle keyword arguments passed as two strided arrays */
+    kwcount *= kwstep;//从这里开始，同时处理了关键字参数以及默认参数的情况
+    for (i = 0; i < kwcount; i += kwstep) {
+        PyObject **co_varnames;//('a','b')
+        PyObject *keyword = kwnames[i];	//kwnames:['b']
+        PyObject *value = kwargs[i];	//kwargs：栈空间中存储给位置参数所赋的值的起始地址，这里指向3
+        Py_ssize_t j;					//变量total_args代表的是位置参数以及强制关键字参数的个数总和
+
+        if (keyword == NULL || !PyUnicode_Check(keyword)) {
+            PyErr_Format(PyExc_TypeError,
+                         "%U() keywords must be strings",
+                         co->co_name);
+            goto fail;
+        }
+
+        /* Speed hack: do raw pointer compares. As names are
+           normally interned this should almost always hit. */
+        co_varnames = ((PyTupleObject *)(co->co_varnames))->ob_item;
+        for (j = 0; j < total_args; j++) {//在co_varnames中，位置参数以及强制关键字参数排在前面，以def func(a=1,b=2,*args,k,m,**kw)为例，该函数对象的对应的code对象的co_varnames为('a', 'b', 'k', 'm', 'args', 'kw')。所以python虚拟机在这里只需要循环co_varnames的前total_args个对象；下标j对应的就是该参数在fastlocals中所对应的下标
+            PyObject *name = co_varnames[j];
+            if (name == keyword) {//根据参数名确定是否找到被赋值的参数
+                goto kw_found;
+            }
+        }
+
+        /* Slow fallback, just in case */
+        for (j = 0; j < total_args; j++) {
+            PyObject *name = co_varnames[j];
+            int cmp = PyObject_RichCompareBool( keyword, name, Py_EQ);
+            if (cmp > 0) {
+                goto kw_found;
+            }
+            else if (cmp < 0) {
+                goto fail;
+            }
+        }
+
+        assert(j >= total_args);
+        if (kwdict == NULL) {//kwdict是用于接收**kw类型参数的字典
+            PyErr_Format(PyExc_TypeError,
+                         "%U() got an unexpected keyword argument '%S'",
+                         co->co_name, keyword);
+            goto fail;
+        }
+
+        if (PyDict_SetItem(kwdict, keyword, value) == -1) {
+            goto fail;
+        }
+        continue;
+
+      kw_found://根据下标j为对应的参数进行赋值，value是在堆栈中的参数值
+        if (GETLOCAL(j) != NULL) {
+            PyErr_Format(PyExc_TypeError,
+                         "%U() got multiple values for argument '%S'",
+                         co->co_name, keyword);
+            goto fail;
+        }
+        Py_INCREF(value);
+        SETLOCAL(j, value);
+    }
+}
+~~~
+
