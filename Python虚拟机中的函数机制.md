@@ -806,6 +806,49 @@ _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,//fu
         Py_INCREF(value);
         SETLOCAL(j, value);
     }
+    /*...*/
+     /* Add missing positional arguments (copy default values from defs) */
+    if (argcount < co->co_argcount) {//为没有赋值的位置参数赋默认值
+        Py_ssize_t m = co->co_argcount - defcount;//m是没有默认值的默认参数的个数
+        Py_ssize_t missing = 0;
+        for (i = argcount; i < m; i++) {//argcount是函数调用时传入的按位置赋值的参数个数；在co_varnames中，没有默认值的位置参数排在默认参数（有默认值的位置参数）之前，而参数在co_varnames中顺序与其在frame对象的fastlocals域中的顺序是对应的，所以在这里，函数的第argcount到第m个位置参数都应该已经被赋值（通过key=value的赋值方式），否则说明位置参数缺失
+            if (GETLOCAL(i) == NULL) {
+                missing++;
+            }
+        }
+        if (missing) {
+            missing_arguments(co, missing, defcount, fastlocals);
+            goto fail;
+        }
+        if (n > m)//执行到这里说明第m个参数之前的参数都已经处理无误；如果n>m，那么func_defaults的前n-m个值所对应的位置参数肯定都已经被赋值
+            i = n - m;
+        else
+            i = 0;//n<=m，说明所有默认参数都有可能没被赋值
+        for (; i < defcount; i++) {//函数的第m个参数开始都是有默认值的（存储在函数的func_defaults域中，值的存储顺序与默认参数的声明顺序相同）。
+            if (GETLOCAL(m+i) == NULL) {
+                PyObject *def = defs[i];
+                Py_INCREF(def);
+                SETLOCAL(m+i, def);
+            }
+        }
+    }
+    /*...*/
 }
 ~~~
+
+假设现在有一个函数f的定义为
+
+~~~Python
+def f(a,b,c=1,d=2)
+~~~
+
+调用代码为
+
+~~~python
+f(1,b=1,c=3)
+~~~
+
+我们画出f被调用时的运行时堆栈以，f对应的frame对象的fastlocals，f对应的code对象的co_varnames域以及f的func_defaults域。
+
+![image-20201225170228435](Python虚拟机中的函数机制.assets/image-20201225170228435.png)
 
