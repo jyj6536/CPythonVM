@@ -731,7 +731,7 @@ _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,//fu
     /*...*/
     const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount;
     
-    /* Copy positional arguments into local variables */
+    /* Copy positional arguments into local variables */ //[A]
     if (argcount > co->co_argcount) {//在这里，argcount代表函数调用时按位置传入的位置函数参数个数，co_argcount代表函数声明中的位置参数个数；本例中argcount为0是因为调用时未采用按位置传入的形式传入位置参数，如果调用形式为func(2,b=3)，那么此处的argcount为1，同时args[0]存放long对象2，后续的for循环就会调用SETLOCAL宏对frame对象的fastlocals[0]进行赋值从而实现局部变量a的初始化
         n = co->co_argcount;
     }
@@ -746,7 +746,7 @@ _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,//fu
     
     /*...*/
     
-    /* Handle keyword arguments passed as two strided arrays */
+    /* Handle keyword arguments passed as two strided arrays *///[B]
     kwcount *= kwstep;//从这里开始，同时处理了关键字参数以及默认参数的情况
     for (i = 0; i < kwcount; i += kwstep) {
         PyObject **co_varnames;//('a','b')
@@ -807,7 +807,7 @@ _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,//fu
         SETLOCAL(j, value);
     }
     /*...*/
-     /* Add missing positional arguments (copy default values from defs) */
+     /* Add missing positional arguments (copy default values from defs) *///[C]
     if (argcount < co->co_argcount) {//为没有赋值的位置参数赋默认值
         Py_ssize_t m = co->co_argcount - defcount;//m是没有默认值的默认参数的个数
         Py_ssize_t missing = 0;
@@ -836,6 +836,8 @@ _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,//fu
 }
 ~~~
 
+通过对源码的分析，我们对默认参数的赋值过程已经有了大体上的了解。接下来我们通过一个例子对位置参数的赋值过程进行总结。
+
 假设现在有一个函数f的定义为
 
 ~~~Python
@@ -848,7 +850,10 @@ def f(a,b,c=1,d=2)
 f(1,b=1,c=3)
 ~~~
 
-我们画出f被调用时的运行时堆栈以，f对应的frame对象的fastlocals，f对应的code对象的co_varnames域以及f的func_defaults域。
+我们画出f被调用时的运行时堆栈，f对应的frame对象的fastlocals域，f对应的code对象的co_varnames域以及f的func_defaults域。
 
 ![image-20201225170228435](Python虚拟机中的函数机制.assets/image-20201225170228435.png)
 
+根据对源码的分析可知，python虚拟机对位置参数的赋值是按照有赋值的无默认值的位置参数、有赋值的默认参数、未赋值的默认参数的顺序进行的。这些赋值动作分别在源代码[A]、[B]、[C]处进行。
+
+![image-20201225202107239](Python虚拟机中的函数机制.assets/image-20201225202107239.png)
