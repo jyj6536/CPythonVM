@@ -731,7 +731,7 @@ _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,//fu
     /*...*/
     const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount;
     
-    /* Copy positional arguments into local variables */ //[A]
+    /* Copy positional arguments into local variables *///[A]
     if (argcount > co->co_argcount) {//在这里，argcount代表函数调用时按位置传入的位置函数参数个数，co_argcount代表函数声明中的位置参数个数；本例中argcount为0是因为调用时未采用按位置传入的形式传入位置参数，如果调用形式为func(2,b=3)，那么此处的argcount为1，同时args[0]存放long对象2，后续的for循环就会调用SETLOCAL宏对frame对象的fastlocals[0]进行赋值从而实现局部变量a的初始化
         n = co->co_argcount;
     }
@@ -857,3 +857,87 @@ f(1,b=1,c=3)
 根据对源码的分析可知，python虚拟机对位置参数的赋值是按照有赋值的无默认值的位置参数、有赋值的默认参数、未赋值的默认参数的顺序进行的。这些赋值动作分别在源代码[A]、[B]、[C]处进行。
 
 ![image-20201225202107239](Python虚拟机中的函数机制.assets/image-20201225202107239.png)
+
+#### 可变参数
+
+pyhton中的函数支持可变数量的位置参数的传递——通过*args的方式来接受多余的位置参数。
+
+我们通过一段代码来考察python中的可变参数是如何传递的。
+
+~~~Python
+def func(a,b,*args):
+    pass
+func(1,2,3,4,5,6)
+##编译后的python字节码
+ 1           0 LOAD_CONST               0 (<code object func at 0x000001E4BF6A0DF0, file ".\test.py", line 1>)
+              2 LOAD_CONST               1 ('func')
+              4 MAKE_FUNCTION            0
+              6 STORE_NAME               0 (func)
+
+  3           8 LOAD_NAME                0 (func)
+             10 LOAD_CONST               2 (1)
+             12 LOAD_CONST               3 (2)
+             14 LOAD_CONST               4 (3)
+             16 LOAD_CONST               5 (4)
+             18 LOAD_CONST               6 (5)
+             20 LOAD_CONST               7 (6)
+             22 CALL_FUNCTION            6
+             24 POP_TOP
+             26 LOAD_CONST               8 (None)
+             28 RETURN_VALUE
+
+Disassembly of <code object func at 0x000001E4BF6A0DF0, file ".\test.py", line 1>:
+  2           0 LOAD_CONST               0 (None)
+              2 RETURN_VALUE
+~~~
+
+画出函数调用时主调函数的运行时堆栈以及func对象所对应的code对象的co_varnames域、frame对象的fastlocals域。
+
+![image-20201229191027373](Python虚拟机中的函数机制.assets/image-20201229191027373.png)
+
+追溯虚拟机的执行流程，再次考察_PyEval_EvalCodeWithName函数
+
+~~~C
+PyObject *
+_PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,
+           PyObject *const *args, Py_ssize_t argcount,
+           PyObject *const *kwnames, PyObject *const *kwargs,
+           Py_ssize_t kwcount, int kwstep,
+           PyObject *const *defs, Py_ssize_t defcount,
+           PyObject *kwdefs, PyObject *closure,
+           PyObject *name, PyObject *qualname)
+{
+    /*...*/
+    /* Copy positional arguments into local variables */
+    if (argcount > co->co_argcount) {//[A]
+        n = co->co_argcount;
+    }
+    else {
+        n = argcount;
+    }
+    for (i = 0; i < n; i++) {
+        x = args[i];
+        Py_INCREF(x);
+        SETLOCAL(i, x);
+    }
+
+    /* Pack other positional arguments into the *args argument */
+    if (co->co_flags & CO_VARARGS) {//CO_VARARGS位被设置说明函数参数中声明了可变参数
+        u = PyTuple_New(argcount - n);//根据标签[A]处对n的处理可知，n一定是小于等于argcount，所以u是大于等于零的
+        if (u == NULL) {
+            goto fail;
+        }
+        SETLOCAL(total_args, u);//使用tuple来接收可变位置参数
+        for (i = n; i < argcount; i++) {//在argcount > co->co_argcount时，说明函数实际接收的参数中是有多余的位置参数的，需要用可变参数来接收
+            x = args[i];
+            Py_INCREF(x);
+            PyTuple_SET_ITEM(u, i-n, x);
+        }
+    }
+    /*...*/
+}
+~~~
+
+python虚拟机接收可变参数的过程已经清晰地展现在我们面前了——在位置参数赋值完成之后，如果还有剩余的按位置传入的参数，那么就新建一个一个tuple来接收这些参数。
+
+![image-20201229191532600](Python虚拟机中的函数机制.assets/image-20201229191532600.png)
