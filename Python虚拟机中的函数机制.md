@@ -941,3 +941,202 @@ _PyEval_EvalCodeWithName(PyObject *_co, PyObject *globals, PyObject *locals,
 python虚拟机接收可变参数的过程已经清晰地展现在我们面前了——在位置参数赋值完成之后，如果还有剩余的按位置传入的参数，那么就新建一个一个tuple来接收这些参数。
 
 ![image-20201229191532600](Python虚拟机中的函数机制.assets/image-20201229191532600.png)
+
+#### 关键字参数以及强制关键字参数
+
+python中强制关键字参数是必须以key-value形式赋值的参数。关键字参数是以**kw形式声明的可以接收任意数量key-value形式参数的参数。
+
+~~~Python
+def func(a,b,*,k=1,d,w=3,**kw):
+    pass
+func(1,2,d=2,w=4,i=10,j=20,z=30)
+##编译后的python字节码
+  1           0 LOAD_CONST               0 (1)
+              2 LOAD_CONST               1 (3)
+              4 LOAD_CONST               2 (('k', 'w'))
+              6 BUILD_CONST_KEY_MAP      2
+              8 LOAD_CONST               3 (<code object func at 0x00000288C4D20DF0, file ".\test.py", line 1>)
+             10 LOAD_CONST               4 ('func')
+             12 MAKE_FUNCTION            2 (kwdefaults)
+             14 STORE_NAME               0 (func)
+
+  3          16 LOAD_NAME                0 (func)
+             18 LOAD_CONST               0 (1)
+             20 LOAD_CONST               5 (2)
+             22 LOAD_CONST               5 (2)
+             24 LOAD_CONST               6 (4)
+             26 LOAD_CONST               7 (10)
+             28 LOAD_CONST               8 (20)
+             30 LOAD_CONST               9 (30)
+             32 LOAD_CONST              10 (('d', 'w', 'i', 'j', 'z'))
+             34 CALL_FUNCTION_KW         7
+             36 POP_TOP
+             38 LOAD_CONST              11 (None)
+             40 RETURN_VALUE
+
+Disassembly of <code object func at 0x00000288C4D20DF0, file ".\test.py", line 1>:
+  2           0 LOAD_CONST               0 (None)
+              2 RETURN_VALUE
+~~~
+
+首先，来看一下字节码BUILD_CONST_KEY_MAP。
+
+~~~C
+case TARGET(BUILD_CONST_KEY_MAP): {
+            Py_ssize_t i;
+            PyObject *map;
+            PyObject *keys = TOP();
+            if (!PyTuple_CheckExact(keys) ||
+                PyTuple_GET_SIZE(keys) != (Py_ssize_t)oparg) {
+                PyErr_SetString(PyExc_SystemError,
+                                "bad BUILD_CONST_KEY_MAP keys argument");
+                goto error;
+            }
+            map = _PyDict_NewPresized((Py_ssize_t)oparg);
+            if (map == NULL) {
+                goto error;
+            }
+            for (i = oparg; i > 0; i--) {
+                int err;
+                PyObject *key = PyTuple_GET_ITEM(keys, oparg - i);
+                PyObject *value = PEEK(i + 1);
+                err = PyDict_SetItem(map, key, value);
+                if (err != 0) {
+                    Py_DECREF(map);
+                    goto error;
+                }
+            }
+
+            Py_DECREF(POP());
+            while (oparg--) {
+                Py_DECREF(POP());
+            }
+            PUSH(map);
+            DISPATCH();
+        }
+~~~
+
+BUILD_CONST_KEY_MAP的作用是构造一个dict对象并压入运行时栈的栈顶。
+
+![image-20201231192835830](Python虚拟机中的函数机制.assets/image-20201231192835830.png)
+
+在BUILD_CONST_KEY_MAP执行之前，虚拟机首先把key-value对的value依次压入堆栈，然后将所有的key组合成为一个tuple并压入堆栈。在构造dict时，虚拟机将堆栈中的value与tuple中的key按顺序对应，调用PyDict_SetItem函数将key-value对置入dict对象中。构造结束后，将dict对象压入运行时堆栈。
+
+了解了BUILD_CONST_KEY_MAP指令之后，我们可以画出堆栈make_function指令执行之前的运行时堆栈。
+
+![image-20201231194149195](Python虚拟机中的函数机制.assets/image-20201231194149195.png)
+
+字节码make_fucntion的参数是2，重新考察make_function的实现
+
+~~~C
+if (oparg & 0x02) {
+    assert(PyDict_CheckExact(TOP()));
+    func->func_kwdefaults = POP();
+}	
+~~~
+
+可以发现，强制关键字参数的默认值被存储到了func对象的func_kwdefaults域中。
+
+<img src="Python虚拟机中的函数机制.assets/image-20201231200840727.png" alt="image-20201231200840727" style="zoom:67%;" />
+
+从运行时堆栈的布局我们可以得出结论，无论是默认参数还是关键字参数，只要是以key-value形式赋值的参数，虚拟机都是先将value按照顺序压入运行时堆栈，然后再将key按顺序组合成一个tuple并压入堆栈。
+
+
+
+~~~C
+PyObject *
+_PyEval_EvalCodeWithName(...)
+{
+    /*...*/
+    
+    /* Handle keyword arguments passed as two strided arrays */
+    kwcount *= kwstep;//从这里开始，同时处理了关键字参数以及默认参数的情况；kwcount是以key-value形式传入的参数的个数
+    for (i = 0; i < kwcount; i += kwstep) {
+        PyObject **co_varnames;//cdoe对象的co_varnames域，('a','b','k','d','w','kw')
+        PyObject *keyword = kwnames[i];	//kwnames——('d', 'w', 'i', 'j', 'z')
+        PyObject *value = kwargs[i];	//传入的key-value参数：kwnames[i]-knames[i]
+        Py_ssize_t j;					//变量total_args代表的是位置参数以及强制关键字参数的个数总和
+
+        if (keyword == NULL || !PyUnicode_Check(keyword)) {
+            PyErr_Format(PyExc_TypeError,
+                         "%U() keywords must be strings",
+                         co->co_name);
+            goto fail;
+        }
+
+        /* Speed hack: do raw pointer compares. As names are
+           normally interned this should almost always hit. */
+        co_varnames = ((PyTupleObject *)(co->co_varnames))->ob_item;
+        for (j = 0; j < total_args; j++) {//在co_varnames中，位置参数以及强制关键字参数排在前面，以def func(a=1,b=2,*args,k,m,**kw)为例，该函数对象的对应的code对象的co_varnames为('a', 'b', 'k', 'm', 'args', 'kw')。所以python虚拟机在这里只需要循环co_varnames的前total_args个对象；下标j对应的就是该参数在fastlocals中所对应的下标
+            PyObject *name = co_varnames[j];
+            if (name == keyword) {//根据参数名确定是否找到被赋值的参数
+                goto kw_found;
+            }
+        }
+
+        /* Slow fallback, just in case */
+        for (j = 0; j < total_args; j++) {
+            PyObject *name = co_varnames[j];
+            int cmp = PyObject_RichCompareBool( keyword, name, Py_EQ);
+            if (cmp > 0) {
+                goto kw_found;
+            }
+            else if (cmp < 0) {
+                goto fail;
+            }
+        }
+
+        assert(j >= total_args);//如果key-value参数的key不在co_varnames中，则说明这个key应该出现在关键字参数中（被**kw接收）
+        if (kwdict == NULL) {//kwdict是用于接收**kw类型参数的字典
+            PyErr_Format(PyExc_TypeError,
+                         "%U() got an unexpected keyword argument '%S'",
+                         co->co_name, keyword);
+            goto fail;
+        }
+
+        if (PyDict_SetItem(kwdict, keyword, value) == -1) {
+            goto fail;
+        }
+        continue;
+
+      kw_found://根据下标j为对应的参数进行赋值，value是在堆栈中的参数值
+        if (GETLOCAL(j) != NULL) {
+            PyErr_Format(PyExc_TypeError,
+                         "%U() got multiple values for argument '%S'",
+                         co->co_name, keyword);
+            goto fail;
+        }
+        Py_INCREF(value);
+        SETLOCAL(j, value);
+    }
+    /*...*/
+      /* Add missing keyword arguments (copy default values from kwdefs) */
+    if (co->co_kwonlyargcount > 0) {//在这里，对强制关键字参数进行了检查——对于依然没有赋值的强制关键字参数，检查func对象的func_kwdefaults中是否存有该关键字参数的默认值，如果没有，那么说明传参时缺少参数，需要抛出异常。
+        Py_ssize_t missing = 0;
+        for (i = co->co_argcount; i < total_args; i++) {
+            PyObject *name;
+            if (GETLOCAL(i) != NULL)
+                continue;
+            name = PyTuple_GET_ITEM(co->co_varnames, i);
+            if (kwdefs != NULL) {
+                PyObject *def = PyDict_GetItem(kwdefs, name);
+                if (def) {
+                    Py_INCREF(def);
+                    SETLOCAL(i, def);
+                    continue;
+                }
+            }
+            missing++;
+        }
+        if (missing) {
+            missing_arguments(co, missing, -1, fastlocals);
+            goto fail;
+        }
+    }
+    /*...*/
+}
+~~~
+
+最终的frame对象中的fastlocals域如下图所示。
+
+![image-20201231204445740](Python虚拟机中的函数机制.assets/image-20201231204445740.png)
