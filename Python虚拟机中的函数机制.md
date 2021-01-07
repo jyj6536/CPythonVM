@@ -1140,3 +1140,156 @@ _PyEval_EvalCodeWithName(...)
 最终的frame对象中的fastlocals域如下图所示。
 
 ![image-20201231204445740](Python虚拟机中的函数机制.assets/image-20201231204445740.png)
+
+#### 闭包
+
+在python中，闭包的创建通常都是利用嵌套函数来完成的。在code对象、frame对象以及func对象中分别有与闭包的实现相关的域。
+
+code对象中与闭包相关的域是co_cellvars和co_freevars。两者的具体含义如下：
+
++ co_cellvars：通常是一个tuple，保存嵌套的作用域中使用的变量名集合。
++ co_freevars：通常是一个tuple，保存了本作用域中使用的外层作用域中的变量名集合。
+
+考虑如下代码
+
+~~~python
+def get_func():
+    value = "outer"
+    def inner_func():
+        return value
+    return inner_func
+print("cellvars of get_func",get_func.__code__.co_cellvars)
+print("freevars of get_func",get_func.__code__.co_freevars)
+ineer = get_func()
+print("cellvar of ineer",ineer.__code__.co_cellvars)
+print("freevars of ineer",ineer.__code__.co_freevars)
+##输出
+cellvars of get_func ('value',)
+freevars of get_func ()
+cellvar of ineer ()
+freevars of ineer ('value',)
+~~~
+
+在frame对象中也有域闭包相关的域——f_localsplus。
+
+~~~C
+extras = code->co_nlocals + ncells + nfrees;
+~~~
+
+![image-20210104194133325](Python虚拟机中的函数机制.assets/image-20210104194133325.png)
+
+extras是图中黄色区域的内存大小。从源代码可以看出，这部分内存由三部分组成——局部变量，cell变量以及free变量。
+
+在func对象中，也有与闭包实现相关的域。
+
+~~~python
+def get_func(a,b=1):
+    value = "outer"
+    b += 1
+    c = 1
+    c += 1
+    def inner_func():
+        print(a)
+        print(b)
+        print(value)
+    return inner_func
+##编译后的python字节码
+  1           0 LOAD_CONST               4 ((1,))
+              2 LOAD_CONST               1 (<code object get_func at 0x000001E28E741EA0, file ".\test.py", line 1>)
+              4 LOAD_CONST               2 ('get_func')
+              6 MAKE_FUNCTION            1 (defaults)
+              8 STORE_NAME               0 (get_func)
+
+ 11          10 LOAD_CONST               3 (None)
+             12 RETURN_VALUE
+
+Disassembly of <code object get_func at 0x000001E28E741EA0, file ".\test.py", line 1>:
+  2           0 LOAD_CONST               1 ('outer')
+              2 STORE_DEREF              2 (value)
+
+  3           4 LOAD_DEREF               1 (b)
+              6 LOAD_CONST               2 (1)
+              8 INPLACE_ADD
+             10 STORE_DEREF              1 (b)
+
+  4          12 LOAD_CONST               2 (1)
+             14 STORE_FAST               2 (c)
+
+  5          16 LOAD_FAST                2 (c)
+             18 LOAD_CONST               2 (1)
+             20 INPLACE_ADD
+             22 STORE_FAST               2 (c)
+
+  6          24 LOAD_CLOSURE             0 (a)
+             26 LOAD_CLOSURE             1 (b)
+             28 LOAD_CLOSURE             2 (value)
+             30 BUILD_TUPLE              3
+             32 LOAD_CONST               3 (<code object inner_func at 0x000001E28E741DF0, file ".\test.py", line 6>)
+             34 LOAD_CONST               4 ('get_func.<locals>.inner_func')
+             36 MAKE_FUNCTION            8 (closure)
+             38 STORE_FAST               3 (inner_func)
+
+ 10          40 LOAD_FAST                3 (inner_func)
+             42 RETURN_VALUE
+
+Disassembly of <code object inner_func at 0x000001E28E741DF0, file ".\test.py", line 6>:
+  7           0 LOAD_GLOBAL              0 (print)
+              2 LOAD_DEREF               0 (a)
+              4 CALL_FUNCTION            1
+              6 POP_TOP
+
+  8           8 LOAD_GLOBAL              0 (print)
+             10 LOAD_DEREF               1 (b)
+             12 CALL_FUNCTION            1
+             14 POP_TOP
+
+  9          16 LOAD_GLOBAL              0 (print)
+             18 LOAD_DEREF               2 (value)
+             20 CALL_FUNCTION            1
+             22 POP_TOP
+             24 LOAD_CONST               0 (None)
+             26 RETURN_VALUE
+~~~
+
+在编译得到的字节码中，我们发现了许多新的字节码。顺着虚拟机的执行流程，我们逐一对这些字节码进行分析。
+
+首先，从对frame对象的分析可以得知，frame对象是运行时动态生成的，而code对象中的闭包信息是编译时就已经静态确定的，所以在分析get_func以及inner_func中的字节码之前，我们还是要回到call_function指令中对虚拟机是如何将code对象中的静态闭包信息转换为frame对象中的动态闭包信息进行分析。
+
+观察get_func函数编译后的字节码可以得出以下结论：
+
+在get_func中，如果操作的局部变量是cell变量（被内层函数引用的变量，比如a、b以及value），使用的是字节码store_deref与load_deref，这与普通局部变量（比如c）使用的字节码load_fast以及store_fast是不同的。粗略观察发现字节码store_deref与load_deref操作的是f_localsplus域中的cell变量区，这说明在func_get函数中的字节码执行之前，cell变量区已经初始化完毕，然而func_get所对应的字节码中并没有与cell变量区初始化相关的字节码。所以，cell变量区的初始化一定是在get_func函数中的字节码执行之前就已经完成了（_PyEval_EvalCodeWithName中）。
+
+将_PyEval_EvalCodeWithName中处理cell变量区的相关部分截取出来
+
+~~~C
+/* Allocate and initialize storage for cell vars, and copy free
+       vars into frame. */
+    for (i = 0; i < PyTuple_GET_SIZE(co->co_cellvars); ++i) {//在这个for循环中对get_func函数所对应的frame对象的f_localsplus域中的cell变量区进行了初始化。
+        PyObject *c;
+        Py_ssize_t arg;
+        /* Possibly account for the cell variable being an argument. */
+        if (co->co_cell2arg != NULL &&
+            (arg = co->co_cell2arg[i]) != CO_CELL_NOT_AN_ARG) {//在这里需要考虑cell变量是一个参数变量的情况。首先要明确一点，当_PyEval_EvalCodeWithName的流程执行到这里时，所有的参数都已经赋值完毕。co->co_cell2arg[i]指示第i个cell变量是否是一个参数变量。如果是，那么co->co_cell2arg[i]的值arg就是该变量在f_localsplus域中的局部变量域的索引值。虚拟机使用该值创建一个新的PyCell对象。
+            c = PyCell_New(GETLOCAL(arg));
+            /* Clear the local copy. */
+            SETLOCAL(arg, NULL);
+        }
+        else {
+            c = PyCell_New(NULL);//流程执行到这里说明第i个cell变量是一个普通的局部变量（非参数），初始化一个空的PyCell对象。之所以初始化为空的PyCell对象，是因为对该cell变量的赋值操作（字节码store_deref）还没有执行。
+        }
+        if (c == NULL)
+            goto fail;
+        SETLOCAL(co->co_nlocals + i, c);
+    }
+~~~
+
+在上面的代码中，我们遇到了一个新的python对象——PyCell对象。
+
+~~~C
+typedef struct {
+    PyObject_HEAD
+    PyObject *ob_ref;       /* Content of the cell or NULL when empty */
+} PyCellObject;
+~~~
+
+这个对象非常简单，仅仅维护了一个ob_ref指针，指向python中的对象。ob_ref指针在PyCell_New函数中被设置。
