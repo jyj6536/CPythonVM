@@ -1141,7 +1141,7 @@ _PyEval_EvalCodeWithName(...)
 
 ![image-20201231204445740](Python虚拟机中的函数机制.assets/image-20201231204445740.png)
 
-#### 闭包
+### 闭包
 
 在python中，闭包的创建通常都是利用嵌套函数来完成的。在code对象、frame对象以及func对象中分别有与闭包的实现相关的域。
 
@@ -1293,3 +1293,93 @@ typedef struct {
 ~~~
 
 这个对象非常简单，仅仅维护了一个ob_ref指针，指向python中的对象。ob_ref指针在PyCell_New函数中被设置。
+
+这部分代码执行结束之后，get_func函数所对应的frame对象的cell变量区已经准备就绪，可以通过相应字节吗进行操作了。我们首先来看store_deref。
+
+```C
+case TARGET(STORE_DEREF): {
+            PyObject *v = POP();
+            PyObject *cell = freevars[oparg];
+            PyObject *oldobj = PyCell_GET(cell);
+            PyCell_SET(cell, v);
+            Py_XDECREF(oldobj);
+            DISPATCH();
+        }
+//freevars的定义以及初始化
+PyObject **fastlocals, **freevars;
+freevars = f->f_localsplus + co->co_nlocals;//cell变量区的起始地址位于局部变量区之后
+
+#define PyCell_GET(op) (((PyCellObject *)(op))->ob_ref)
+#define PyCell_SET(op, v) (((PyCellObject *)(op))->ob_ref = v)
+```
+
+可以看到，store_deref主要执行以下动作：
+
++ 弹出栈顶元素v
++ 获取cell变量区中下标为oparg的cell对象cell
++ 获取该cell对象所引用的对象oldobj
++ 将v设为cell的引用对象
++ 减少oldobj的引用计数
+
+简而言之，就是将栈顶的python对象设置到freevars[oparg]的引用指针ob_ref上。
+
+参考store_deref，字节码load_deref的作用也很明显了。
+
+```C
+case TARGET(LOAD_DEREF): {
+            PyObject *cell = freevars[oparg];
+            PyObject *value = PyCell_GET(cell);
+            if (value == NULL) {
+                format_exc_unbound(co, oparg);
+                goto error;
+            }
+            Py_INCREF(value);
+            PUSH(value);
+            DISPATCH();
+        }
+```
+
+在了解了store_deref与load_deref这两条字节码之后，
+
+我们可以画出24 load_closure执行之前get_func函数所对应的frame对象的f_localsplus域局部变量区以及cell变量区的情况了。
+
+![image-20210108232356683](Python虚拟机中的函数机制.assets/image-20210108232356683.png)
+
+从24 load_closure开始，python虚拟机进入func对象inner_func的创建流程。
+
+首先来看字节码load_closure的实现。
+
+~~~C
+case TARGET(LOAD_CLOSURE): {
+            PyObject *cell = freevars[oparg];
+            Py_INCREF(cell);
+            PUSH(cell);
+            DISPATCH();
+        }
+~~~
+
+load_closure的实现很简单，就是把下标为oparg的cell对象压入运行时堆栈。
+
+在将a、b以及value对应cell对象入栈之后，虚拟机将这三个对象组装到了一个tuple中，然后将inner_func对应的code对象、“inner_func”入栈，执行36 make_function开始生成inner_func所对应的func对象。
+
+重新考察字节吗make_function
+
+~~~C
+            if (oparg & 0x08) {  
+                assert(PyTuple_CheckExact(TOP()));
+                func ->func_closure = POP();
+~~~
+
+可以看到，之前组装的tuple被赋值给了func对象的func_closure域。这个域在哪里生效呢？答案依然是_PyEval_EvalCodeWithName函数中。
+
+~~~c
+ /* Copy closure variables to free variables */
+    for (i = 0; i < PyTuple_GET_SIZE(co->co_freevars); ++i) {//将tuple中的中cell对象的引用复制到inner_func的free变量区
+        PyObject *o = PyTuple_GET_ITEM(closure, i);
+        Py_INCREF(o);
+        freevars[PyTuple_GET_SIZE(co->co_cellvars) + i] = o;//freevars[PyTuple_GET_SIZE(co->co_cellvars)]正好是free变量区的起始地址
+    }
+~~~
+
+在这里要注意的是，此处的_PyEval_EvalCodeWithName是在执行 inner_func函数的过程中执行的。上面处理cell变量区的\_PyEval_EvalCodeWithName是在执行get_func的过程中执行的。
+
