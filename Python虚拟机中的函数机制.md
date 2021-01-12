@@ -1383,3 +1383,10 @@ load_closure的实现很简单，就是把下标为oparg的cell对象压入运�
 
 在这里要注意的是，此处的_PyEval_EvalCodeWithName是在执行 inner_func函数的过程中执行的。上面处理cell变量区的\_PyEval_EvalCodeWithName是在执行get_func的过程中执行的。
 
+inner_func的free变量区
+
+![image-20210112182424130](Python虚拟机中的函数机制.assets/image-20210112182424130.png)
+
+在inner_func函数中的对闭包变量a、b以及value的访问均是通过字节码xxx_deref实现的。所以我们可以得出结论：在inner_func调用的过程中，当引用外层作用域的符号时，一定是到inner_func对应的f_localsplus域中的free变量区中获取符号对应的值。
+
+到这里我们已经剖析完了closure从创建、传递到使用的全过程。
