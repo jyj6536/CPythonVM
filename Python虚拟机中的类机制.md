@@ -699,3 +699,590 @@ type___subclasses___impl(PyTypeObject *self)
 
 ## 用户自定义class
 
+在本节中，我们将正式开始研究用户自定义type。首先来研究单个class的实现。 在之前对函数机制的考察中我们可以发现，对于一个包含有函数定义的python源文件，在python中编译之后会得到一个与源文件对应的code对象A，而与函数对应的code对象B则存储在A的co_consts变量中。那么根据经验推测，对于包含类的python源文件，编译之后与源文件对应的code对象的co_consts会包含一个与class对应的code对象，也就是说，与函数对象类似，class对象的声明与实现也是分离的。
+
+![image-20210216154559640](Python虚拟机中的类机制.assets/image-20210216154559640.png)
+
+上图展示了编译后的test.py的code对象之间的关系。实线表示包含关系，比如，f的对应的字节码包含在f对应的code对象中，而创建f的字节码却包含在A的code对象中。
+
+当python虚拟机开始执行test.py时，首先执行的就是“class A”这条python语句，并创建class 对象。
+
+
+~~~python
+class A(object):
+    name = 'Python'
+    def __init__(self):
+        print("A::__init__")
+    def f(self):
+        print("A::f")
+    def g(self,value):
+        self.value = value
+        print(self.value)
+a = A()
+a.f()
+a.g(10)
+# 编译结果
+  1           0 LOAD_BUILD_CLASS
+              2 LOAD_CONST               0 (<code object A at 0x00000225DBA66030, file ".\test.py", line 1>)
+              4 LOAD_CONST               1 ('A')
+              6 MAKE_FUNCTION            0
+              8 LOAD_CONST               1 ('A')
+             10 LOAD_NAME                0 (object)
+             12 CALL_FUNCTION            3
+             14 STORE_NAME               1 (A)
+
+ 10          16 LOAD_NAME                1 (A)
+             18 CALL_FUNCTION            0
+             20 STORE_NAME               2 (a)
+
+ 11          22 LOAD_NAME                2 (a)
+             24 LOAD_METHOD              3 (f)
+             26 CALL_METHOD              0
+             28 POP_TOP
+
+ 12          30 LOAD_NAME                2 (a)
+             32 LOAD_METHOD              4 (g)
+             34 LOAD_CONST               2 (10)
+             36 CALL_METHOD              1
+             38 POP_TOP
+             40 LOAD_CONST               3 (None)
+             42 RETURN_VALUE
+
+Disassembly of <code object A at 0x00000225DBA66030, file ".\test.py", line 1>:
+  1           0 LOAD_NAME                0 (__name__)
+              2 STORE_NAME               1 (__module__)
+              4 LOAD_CONST               0 ('A')
+              6 STORE_NAME               2 (__qualname__)
+
+  2           8 LOAD_CONST               1 ('Python')
+             10 STORE_NAME               3 (name)
+
+  3          12 LOAD_CONST               2 (<code object __init__ at 0x00000225DBA61DF0, file ".\test.py", line 3>)
+             14 LOAD_CONST               3 ('A.__init__')
+             16 MAKE_FUNCTION            0
+             18 STORE_NAME               4 (__init__)
+
+  5          20 LOAD_CONST               4 (<code object f at 0x00000225DBA61EA0, file ".\test.py", line 5>)
+             22 LOAD_CONST               5 ('A.f')
+             24 MAKE_FUNCTION            0
+             26 STORE_NAME               5 (f)
+
+  7          28 LOAD_CONST               6 (<code object g at 0x00000225DBA61F50, file ".\test.py", line 7>)
+             30 LOAD_CONST               7 ('A.g')
+             32 MAKE_FUNCTION            0
+             34 STORE_NAME               6 (g)
+             36 LOAD_CONST               8 (None)
+             38 RETURN_VALUE
+
+Disassembly of <code object __init__ at 0x00000225DBA61DF0, file ".\test.py", line 3>:
+  4           0 LOAD_GLOBAL              0 (print)
+              2 LOAD_CONST               1 ('A::__init__')
+              4 CALL_FUNCTION            1
+              6 POP_TOP
+              8 LOAD_CONST               0 (None)
+             10 RETURN_VALUE
+
+Disassembly of <code object f at 0x00000225DBA61EA0, file ".\test.py", line 5>:
+  6           0 LOAD_GLOBAL              0 (print)
+              2 LOAD_CONST               1 ('A::f')
+              4 CALL_FUNCTION            1
+              6 POP_TOP
+              8 LOAD_CONST               0 (None)
+             10 RETURN_VALUE
+
+Disassembly of <code object g at 0x00000225DBA61F50, file ".\test.py", line 7>:
+  8           0 LOAD_FAST                1 (value)
+              2 LOAD_FAST                0 (self)
+              4 STORE_ATTR               0 (value)
+
+  9           6 LOAD_GLOBAL              1 (print)
+              8 LOAD_FAST                0 (self)
+             10 LOAD_ATTR                0 (value)
+             12 CALL_FUNCTION            1
+             14 POP_TOP
+             16 LOAD_CONST               0 (None)
+             18 RETURN_VALUE
+~~~
+
+在创建class对象的过程中，首先要创建class对象的元信息，比如class的名称，所拥有的方法、属性等。该class实例化时还要为实例对象申请内存空间。对于我们所定义的class A来说，我们必须了解A的元信息才能创建A的class对象。
+
+我们从第一行字节码开始考察。
+
+~~~C
+case TARGET(LOAD_BUILD_CLASS): {
+            _Py_IDENTIFIER(__build_class__);
+
+            PyObject *bc;
+            if (PyDict_CheckExact(f->f_builtins)) {
+                bc = _PyDict_GetItemId(f->f_builtins, &PyId___build_class__);//从builtins名字空间中寻找__build_class__
+                if (bc == NULL) {
+                    PyErr_SetString(PyExc_NameError,
+                                    "__build_class__ not found");
+                    goto error;
+                }
+                Py_INCREF(bc);
+            }
+            else {
+                PyObject *build_class_str = _PyUnicode_FromId(&PyId___build_class__);
+                if (build_class_str == NULL)
+                    goto error;
+                bc = PyObject_GetItem(f->f_builtins, build_class_str);
+                if (bc == NULL) {
+                    if (PyErr_ExceptionMatches(PyExc_KeyError))
+                        PyErr_SetString(PyExc_NameError,
+                                        "__build_class__ not found");
+                    goto error;
+                }
+            }
+            PUSH(bc);//入栈
+            DISPATCH();
+        }
+~~~
+
+load_build_class的作用比较简单，就是从builtin名字空间将函数builtins.\__build_class__压入运行时堆栈。这个函数是生成class的关键。
+
+接下来，虚拟机将class A对应的code对象以及class A的名字‘A’压入了运行时堆栈，并调用了make_function函数创建了一个名为A的函数压入运行时堆栈。然后虚拟机又向堆栈中压入了类名’A‘以及class A的基类object，我们画出此时test.py对应的运行时堆栈。
+
+![image-20210217103939402](Python虚拟机中的类机制.assets/image-20210217103939402.png)
+
+在这里，生成class A的准备工作已经停当，虚拟机执行了字节码call_function开始了class A的生成工作。
+
+builtins.\__build_class__的类型是PyCFunction_Type，所以在call_function函数中执行的分支与我们在函数机制中所讨论的不同。
+
+~~~C
+Py_LOCAL_INLINE(PyObject *) _Py_HOT_FUNCTION
+call_function(PyObject ***pp_stack, Py_ssize_t oparg, PyObject *kwnames)
+{
+    PyObject **pfunc = (*pp_stack) - oparg - 1;
+    PyObject *func = *pfunc;
+    PyObject *x, *w;
+    Py_ssize_t nkwargs = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
+    Py_ssize_t nargs = oparg - nkwargs;
+    PyObject **stack = (*pp_stack) - nargs - nkwargs;
+
+    /* Always dispatch PyCFunction first, because these are
+       presumed to be the most frequent callable object.
+    */
+    if (PyCFunction_Check(func)) {//builtins.__build_class__执行到了这里
+        PyThreadState *tstate = _PyThreadState_GET();
+        C_TRACE(x, _PyCFunction_FastCallKeywords(func, stack, nargs, kwnames));
+    }
+~~~
+
+进入_PyCFunction_FastCallKeywords函数
+
+~~~C
+PyObject *
+_PyCFunction_FastCallKeywords(PyObject *func,
+                              PyObject *const *args, Py_ssize_t nargs,
+                              PyObject *kwnames)
+{
+    PyObject *result;
+
+    assert(func != NULL);
+    assert(PyCFunction_Check(func));
+
+    result = _PyMethodDef_RawFastCallKeywords(((PyCFunctionObject*)func)->m_ml,
+                                              PyCFunction_GET_SELF(func),
+                                              args, nargs, kwnames);
+    result = _Py_CheckFunctionResult(func, result, NULL);
+    return result;
+}
+~~~
+
+在继续追溯之前，我们来看一下PyCFunction的定义以及builtins.\__build_class__的初始化。
+
+~~~C
+typedef struct {
+    PyObject_HEAD
+    PyMethodDef *m_ml; /* Description of the C function to call */
+    PyObject    *m_self; /* Passed as 'self' arg to the C func, can be NULL */
+    PyObject    *m_module; /* The __module__ attribute, can be anything */
+    PyObject    *m_weakreflist; /* List of weak references */
+} PyCFunctionObject;
+
+struct PyMethodDef {
+    const char  *ml_name;   /* The name of the built-in function/method */
+    PyCFunction ml_meth;    /* The C function that implements it */
+    int         ml_flags;   /* Combination of METH_xxx flags, which mostly
+                               describe the args expected by the C func */
+    const char  *ml_doc;    /* The __doc__ attribute, or NULL */
+};
+
+typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+
+static PyMethodDef builtin_methods[] = {
+    {"__build_class__", (PyCFunction)(void(*)(void))builtin___build_class__,
+     METH_FASTCALL | METH_KEYWORDS, build_class_doc},
+~~~
+
+根据ml_flags我们可以找到_PyMethodDef_RawFastCallKeywords中所执行的分支。
+
+~~~C
+PyObject *
+_PyMethodDef_RawFastCallKeywords(PyMethodDef *method, PyObject *self,
+                                 PyObject *const *args, Py_ssize_t nargs,
+                                 PyObject *kwnames)
+{
+    PyCFunction meth = method->ml_meth;//如果我们以调用__build_class__为例，那么这里的meth指向的就是builtin___build_class__这个函数
+    switch (flags)
+    {
+        case METH_FASTCALL | METH_KEYWORDS:
+        /* Fast-path: avoid temporary dict to pass keyword arguments */
+        result = ((_PyCFunctionFastWithKeywords)(void(*)(void))meth) (self, args, nargs, kwnames);//这里的args指向的是待传参数的基地址，即test.py的运行时栈中存放func 'A'的那个slot，nargs是参数数量，在这里等于3
+        break;
+    }
+}
+~~~
+
+从这里开始，我们正式进入\__build_class__的流程
+
+~~~C
+static PyObject *
+builtin___build_class__(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
+                        PyObject *kwnames)
+{
+    PyObject *func, *name, *bases, *mkw, *meta, *winner, *prep, *ns, *orig_bases;
+    PyObject *cls = NULL, *cell = NULL;
+    int isclass = 0;   /* initialize to prevent gcc warning */
+
+    if (nargs < 2) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__build_class__: not enough arguments");
+        return NULL;
+    }
+    //args[0]：根据class A的code对象生成的func对象
+    func = args[0];   /* Better be callable */
+    if (!PyFunction_Check(func)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__build_class__: func must be a function");
+        return NULL;
+    }
+    //args[1]：class A的类名A
+    name = args[1];
+    if (!PyUnicode_Check(name)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "__build_class__: name is not a string");
+        return NULL;
+    }
+    //将class A的直接基类组装到一个tuple中，在这里只有一个object
+    orig_bases = _PyStack_AsTupleSlice(args, nargs, 2, nargs);
+    if (orig_bases == NULL)
+        return NULL;
+    //对于orig_bases中的对象，如果该对象不是类型对象，那么查找该对象是否定义了__mro_entries__方法，如果定义了该方法就将orig_bases作为参数调用该方法；该方法会返回一个元组，元组中的内容会代替该对象在基类列表中的位置。比如对基类列表[A,B,C]调用该方法，B不是class对象且定义了__mro_entries__方法，返回[b1,b2,b3],那么最终的bases为[A,b1,b2,b3,C]
+    bases = update_bases(orig_bases, args + 2, nargs - 2);
+    if (bases == NULL) {
+        Py_DECREF(orig_bases);
+        return NULL;
+    }
+    /*
+    metaclass选择：
+    	1.没有显式给出metaclass则使用type
+    	2.显式给出的metaclass对象不是class对象则使用给出的metaclass对象
+    	3.显式给出的metaclass对象是一个class对象，或者基类被定义了，那么要计算the most derived metaclass
+    */
+	//判断是否显式给出metaclass
+    if (kwnames == NULL) {//未显式给出metaclass
+        meta = NULL;
+        mkw = NULL;
+    }
+    else {
+        mkw = _PyStack_AsDict(args + nargs, kwnames);//将创建A时传入的参数组装为一个字典mkw，比如class A(k1=v1,k2=v2)被组装为{"k1":v1,"k2":v2}
+        if (mkw == NULL) {
+            Py_DECREF(bases);
+            return NULL;
+        }
+
+        meta = _PyDict_GetItemId(mkw, &PyId_metaclass);//在mkw中寻找metaclass
+        if (meta != NULL) {
+            Py_INCREF(meta);
+            if (_PyDict_DelItemId(mkw, &PyId_metaclass) < 0) {
+                Py_DECREF(meta);
+                Py_DECREF(mkw);
+                Py_DECREF(bases);
+                return NULL;
+            }
+            /* metaclass is explicitly given, check if it's indeed a class */
+            isclass = PyType_Check(meta);
+        }
+    }
+    if (meta == NULL) {
+        /* if there are no bases, use type: *///未显式指定metaclass且未指定基类则使用type作为metaclass
+        if (PyTuple_GET_SIZE(bases) == 0) {
+            meta = (PyObject *) (&PyType_Type);
+        }
+        /* else get the type of the first base *///使用第一个基类的类型作为metaclass
+        else {
+            PyObject *base0 = PyTuple_GET_ITEM(bases, 0);
+            meta = (PyObject *) (base0->ob_type);
+        }
+        Py_INCREF(meta);
+        isclass = 1;  /* meta is really a class */
+    }
+
+    if (isclass) {
+        /* meta is really a class, so check for a more derived
+           metaclass, or possible metaclass conflicts: */
+        winner = (PyObject *)_PyType_CalculateMetaclass((PyTypeObject *)meta,
+                                                        bases);//metaclass选择——从class A的基类列表中选择继承层次最深的类作为metaclass
+        if (winner == NULL) {
+            Py_DECREF(meta);
+            Py_XDECREF(mkw);
+            Py_DECREF(bases);
+            return NULL;
+        }
+        if (winner != meta) {
+            Py_DECREF(meta);
+            meta = winner;
+            Py_INCREF(meta);
+        }
+    }
+    /* else: meta is not a class, so we cannot do the metaclass
+       calculation, so we will use the explicitly given object as it is */
+    if (_PyObject_LookupAttrId(meta, &PyId___prepare__, &prep) < 0) {//查找meta中是否有__prepare__属性如果有则调用以设置class的namespace
+        ns = NULL;//出错
+    }
+    else if (prep == NULL) {
+        ns = PyDict_New();//__prepare__属性不存在
+    }
+    else {
+        PyObject *pargs[2] = {name, bases};
+        ns = _PyObject_FastCallDict(prep, pargs, 2, mkw);//调用__prepare__初始化class A的namespace
+        Py_DECREF(prep);
+    }
+    if (ns == NULL) {
+        Py_DECREF(meta);
+        Py_XDECREF(mkw);
+        Py_DECREF(bases);
+        return NULL;
+    }
+    if (!PyMapping_Check(ns)) {
+        PyErr_Format(PyExc_TypeError,
+                     "%.200s.__prepare__() must return a mapping, not %.200s",
+                     isclass ? ((PyTypeObject *)meta)->tp_name : "<metaclass>",
+                     Py_TYPE(ns)->tp_name);
+        goto error;
+    }
+    cell = PyEval_EvalCodeEx(PyFunction_GET_CODE(func), PyFunction_GET_GLOBALS(func), ns,
+                             NULL, 0, NULL, 0, NULL, 0, NULL,
+                             PyFunction_GET_CLOSURE(func));//执行根据class A的code对象所生成的函数，生成class A的动态元信息
+    if (cell != NULL) {
+        if (bases != orig_bases) {
+            if (PyMapping_SetItemString(ns, "__orig_bases__", orig_bases) < 0) {
+                goto error;
+            }
+        }
+        PyObject *margs[3] = {name, bases, ns};
+        cls = _PyObject_FastCallDict(meta, margs, 3, mkw);//创建class A
+        if (cls != NULL && PyType_Check(cls) && PyCell_Check(cell)) {
+            PyObject *cell_cls = PyCell_GET(cell);
+            if (cell_cls != cls) {
+                if (cell_cls == NULL) {
+                    const char *msg =
+                        "__class__ not set defining %.200R as %.200R. "
+                        "Was __classcell__ propagated to type.__new__?";
+                    PyErr_Format(PyExc_RuntimeError, msg, name, cls);
+                } else {
+                    const char *msg =
+                        "__class__ set to %.200R defining %.200R as %.200R";
+                    PyErr_Format(PyExc_TypeError, msg, cell_cls, name, cls);
+                }
+                Py_DECREF(cls);
+                cls = NULL;
+                goto error;
+            }
+        }
+    }
+error:
+    Py_XDECREF(cell);
+    Py_DECREF(ns);
+    Py_DECREF(meta);
+    Py_XDECREF(mkw);
+    Py_DECREF(bases);
+    if (bases != orig_bases) {
+        Py_DECREF(orig_bases);
+    }
+    return cls;
+}
+~~~
+
+通过上述对源码的分析，我们可以看到python中创建一个用户自定义类的过程总体上可以分为一下几步：
+
+1. MRO解析
+2. 确定metaclass
+3. namespace准备
+4. 执行class body
+5. 创建class object
+
+### 执行class body
+
+执行class body的过程就是生成class动态元信息的过程。class的动态元信息是指只有在运行时才能确定的信息，在本例中，class A的name属性以及三个成员函数就是class A的动态元信息。
+
+在class A对应的字节码中，虚拟机通过load_name指令将class A的成员放入了A的locals namespace中，这里所说的A的locals namespace就是在调用A时所传入的那个dict类型的参数“ns”。我们可以画出A在调用完成之后的ns的内容（也就是class A的动态元信息）。
+
+![image-20210220105952906](Python虚拟机中的类机制.assets/image-20210220105952906.png)
+
+### 创建class object
+
+获取了class A的动态元信息之后就进入了class A的创建过程。在这里，虚拟机对metalcas进行了调用。
+
+可调用性在python中是一个非常通用的概念。对于一个类型T来说，只要T的定义中的tp_call指针被实现，那么类型T就是可调用的。在这里，我们的metaclass明显也应该是一个可调用对象。在python中，一般情况下，metaclass都会被指定为type对象，所以我们来考察一下type对象的tp_call的具体实现。
+
+在type对象中，tp_call的具体实现是type_call函数
+
+```c
+static PyObject *
+type_call(PyTypeObject *type, PyObject *args, PyObject *kwds)//meta,tuple(name,bases,ns),mkw
+{
+    PyObject *obj;
+
+    if (type->tp_new == NULL) {
+        PyErr_Format(PyExc_TypeError,
+                     "cannot create '%.100s' instances",
+                     type->tp_name);
+        return NULL;
+    }
+
+#ifdef Py_DEBUG
+    /* type_call() must not be called with an exception set,
+       because it can clear it (directly or indirectly) and so the
+       caller loses its exception */
+    assert(!PyErr_Occurred());
+#endif
+
+    obj = type->tp_new(type, args, kwds);
+    /*...*/
+}
+```
+
+type对象中的tp_new指向type_new函数，这个函数才是class对象创建的第一现场。
+
+```C
+static PyObject *
+type_new(PyTypeObject *metatype, PyObject *args, PyObject *kwds)
+{
+    PyObject *name, *bases = NULL, *orig_dict, *dict = NULL;
+    PyObject *qualname, *slots = NULL, *tmp, *newslots, *cell;
+    PyTypeObject *type = NULL, *base, *tmptype, *winner;
+    PyHeapTypeObject *et;
+    PyMemberDef *mp;
+    Py_ssize_t i, nbases, nslots, slotoffset, name_size;
+    int j, may_add_dict, may_add_weak, add_dict, add_weak;
+    //将参数列表中的类名、基类列表、属性表分别解析到name、bases、orig_dict三个变量中
+    /* Check arguments: (name, bases, dict) */
+    if (!PyArg_ParseTuple(args, "UO!O!:type.__new__", &name, &PyTuple_Type,
+                          &bases, &PyDict_Type, &orig_dict))
+        return NULL;
+    //确定最佳的metaclass，存储在metatype中
+    //确定最佳的基类，存储在base中
+    /* Adjust for empty tuple bases */
+    nbases = PyTuple_GET_SIZE(bases);
+    if (nbases == 0) {
+        base = &PyBaseObject_Type;
+        bases = PyTuple_Pack(1, base);
+        if (bases == NULL)
+            return NULL;
+        nbases = 1;
+    }
+    else {
+        /*...*/
+    }
+    
+    dict = PyDict_Copy(orig_dict);
+    if (dict == NULL)
+        goto error;
+	//处理__slots__属性
+    /* Check for a __slots__ sequence variable in dict, and count it */
+    slots = _PyDict_GetItemId(dict, &PyId___slots__);
+    /*...*/
+    
+    //为class对象申请内存
+    //type对象的tp_alloc为NULL，这里调用的是type对象从object对象继承的tp_alloc
+    /* Allocate the type object */
+    type = (PyTypeObject *)metatype->tp_alloc(metatype, nslots);
+    if (type == NULL)
+        goto error;
+
+    /* Keep name and slots alive in the extended type object */
+    et = (PyHeapTypeObject *)type;
+    Py_INCREF(name);
+    et->ht_name = name;
+    et->ht_slots = slots;
+    slots = NULL;
+    /*...*/
+    
+    //设置tp_flags
+      /* Initialize tp_flags */
+    type->tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HEAPTYPE |
+        Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_FINALIZE;
+    if (base->tp_flags & Py_TPFLAGS_HAVE_GC)
+        type->tp_flags |= Py_TPFLAGS_HAVE_GC;
+    //初始化type中的各个域
+    /* Initialize essential fields */
+    type->tp_as_async = &et->as_async;
+    type->tp_as_number = &et->as_number;
+    type->tp_as_sequence = &et->as_sequence;
+    type->tp_as_mapping = &et->as_mapping;
+    type->tp_as_buffer = &et->as_buffer;
+    type->tp_name = PyUnicode_AsUTF8AndSize(name, &name_size);
+    if (!type->tp_name)
+        goto error;
+    if (strlen(type->tp_name) != (size_t)name_size) {
+        PyErr_SetString(PyExc_ValueError,
+                        "type name must not contain null characters");
+        goto error;
+    }
+    
+    //设置基类
+    /* Set tp_base and tp_bases */
+    type->tp_bases = bases;
+    bases = NULL;
+    Py_INCREF(base);
+    type->tp_base = base;
+    //设置属性表
+    /* Initialize tp_dict from passed-in dict */
+    Py_INCREF(dict);
+    type->tp_dict = dict;
+    
+    /* Set ht_qualname to dict['__qualname__'] if available, else to
+       __name__.  The __qualname__ accessor will look for ht_qualname.
+    */
+    qualname = _PyDict_GetItemId(dict, &PyId___qualname__);
+    /*...*/
+    //如果自定义类中重写了__new__函数，将其改造为static函数
+     /* Special-case __new__: if it's a plain function,
+       make it a static function */
+    tmp = _PyDict_GetItemId(dict, &PyId___new__);
+    if (tmp != NULL && PyFunction_Check(tmp)) {
+        tmp = PyStaticMethod_New(tmp);
+        if (tmp == NULL)
+            goto error;
+        if (_PyDict_SetItemId(dict, &PyId___new__, tmp) < 0) {
+            Py_DECREF(tmp);
+            goto error;
+        }
+        Py_DECREF(tmp);
+    }
+    /*...*/
+    //为class对象对应的instance设置内存大小信息
+    /* Add descriptors for custom slots from __slots__, or for __dict__ */
+    mp = PyHeapType_GET_MEMBERS(et);
+    slotoffset = base->tp_basicsize;
+    /*...*/
+    //根据属性是否重写，在slot中存储合适的函数
+    /* Put the proper slots in place */
+    fixup_slot_dispatchers(type);
+    //调用PyType_Ready对class对象进行初始化
+    /* Initialize the rest */
+    if (PyType_Ready(type) < 0)
+        goto error;
+    /*...*/
+}
+```
+
+在本质上，无论用户自定义的class对象还是内置的class对象，在python虚拟机内部，都可以用一个PyTypeObject来表示。但是，内置class对象的PyTypeObject与其关联的PyNumberMethods等的内存位置都是在编译时确定的，它们在内存中的位置是分离的；而用户自定义的class对象 PyTypeObject和PyNumberMethods等的位置在内从中是连续的，必须在运行时动态申请。
+
+[Under the hood of Python class definitions - Eli Bendersky's website (thegreenplace.net)](https://eli.thegreenplace.net/2012/06/15/under-the-hood-of-python-class-definitions#id13)
+
+[metaclass](https://stackless.readthedocs.io/en/3.7-slp/reference/datamodel.html#metaclasses)
+
