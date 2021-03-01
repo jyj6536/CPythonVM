@@ -1269,6 +1269,15 @@ type_new(PyTypeObject *metatype, PyObject *args, PyObject *kwds)
     mp = PyHeapType_GET_MEMBERS(et);
     slotoffset = base->tp_basicsize;
     /*...*/
+    if (add_dict) {
+        if (base->tp_itemsize)
+            type->tp_dictoffset = -(long)sizeof(PyObject *);
+        else
+            type->tp_dictoffset = slotoffset;
+        slotoffset += sizeof(PyObject *);//为instance的__dict__设置的额外空间
+    }
+    
+    /*...*/
     //根据属性是否重写，在slot中存储合适的函数
     /* Put the proper slots in place */
     fixup_slot_dispatchers(type);
@@ -1282,7 +1291,535 @@ type_new(PyTypeObject *metatype, PyObject *args, PyObject *kwds)
 
 在本质上，无论用户自定义的class对象还是内置的class对象，在python虚拟机内部，都可以用一个PyTypeObject来表示。但是，内置class对象的PyTypeObject与其关联的PyNumberMethods等的内存位置都是在编译时确定的，它们在内存中的位置是分离的；而用户自定义的class对象 PyTypeObject和PyNumberMethods等的位置在内从中是连续的，必须在运行时动态申请。
 
-[Under the hood of Python class definitions - Eli Bendersky's website (thegreenplace.net)](https://eli.thegreenplace.net/2012/06/15/under-the-hood-of-python-class-definitions#id13)
+### 创建类实例
 
-[metaclass](https://stackless.readthedocs.io/en/3.7-slp/reference/datamodel.html#metaclasses)
+在这里，我们终于得到了A这个类型对象，并通过store_name将A存到了locals名字空间中。接下来虚拟机开始了A类的实例a的创建过程。
 
+```Python
+a = A()
+###
+ 10          16 LOAD_NAME                1 (A)
+             18 CALL_FUNCTION            0
+             20 STORE_NAME               2 (a)
+```
+
+虚拟机通过调用class A来创建A的实例对象a。虚拟机在创建了instance对象之后，通过指令store_name指令将a放到了locals名字空间中。
+
+在这里的call_function指令中，虚拟机会沿着call_function->_PyObject_FastCallKeywords->class A->ob_type->tp_call的顺序进行调用。A的类型是type，所以tp_call调用的是type.tp_call。在type.t_call中又调用了A.tp_new来创建instance对象。在这里我们知道，在A的初始化过程中，虚拟机对PyType_Ready对A进行了初始化，其中一项就是继承基类的操作，所以A.tp_new实际上也就是object.tp_new，在PyBaseObject中，tp_new指向的是object_new。创建class对象和创建instance对象的不同指出正在与tp_new的不同。创建class对象，虚拟机使用的是type_new，创建instance对象，虚拟机使用的是object_new。
+
+```C
+static PyObject *
+type_call(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    PyObject *obj;
+
+    if (type->tp_new == NULL) {
+        PyErr_Format(PyExc_TypeError,
+                     "cannot create '%.100s' instances",
+                     type->tp_name);
+        return NULL;
+    }
+
+#ifdef Py_DEBUG
+    /* type_call() must not be called with an exception set,
+       because it can clear it (directly or indirectly) and so the
+       caller loses its exception */
+    assert(!PyErr_Occurred());
+#endif
+
+    obj = type->tp_new(type, args, kwds);//当type为class A时，这里调用的是A从object继承而来的object.tp_new
+    obj = _Py_CheckFunctionResult((PyObject*)type, obj, NULL);
+    if (obj == NULL)
+        return NULL;
+
+    /*...*/
+    if (!PyType_IsSubtype(Py_TYPE(obj), type))
+        return obj;
+
+    type = Py_TYPE(obj);
+    if (type->tp_init != NULL) {//尝试执行__init__进行初始化动作
+        int res = type->tp_init(obj, args, kwds);
+        if (res < 0) {
+            assert(PyErr_Occurred());
+            Py_DECREF(obj);
+            obj = NULL;
+        }
+        else {
+            assert(!PyErr_Occurred());
+        }
+    }
+    return obj;
+}
+```
+
+```C
+static PyObject *
+object_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    
+    /*...*/
+    return type->tp_alloc(type, 0);//在这里，class A继承自object的tp_alloc
+}
+```
+
+由于我们的class A重写了\__init__，所以在 fixup_slot_dispatchers，tp_init会指向slotdefs中指定的与之对应的slot_tp_init。
+
+~~~C
+static int
+slot_tp_init(PyObject *self, PyObject *args, PyObject *kwds)
+{
+    _Py_IDENTIFIER(__init__);
+    int unbound;
+    PyObject *meth = lookup_method(self, &PyId___init__, &unbound);//在class对象以及class的mro列表中寻找__init__
+    PyObject *res;
+
+    if (meth == NULL)
+        return -1;
+    if (unbound) {
+        res = _PyObject_Call_Prepend(meth, self, args, kwds);
+    }
+    else {
+        res = PyObject_Call(meth, args, kwds);
+    }
+    Py_DECREF(meth);
+    if (res == NULL)
+        return -1;
+    if (res != Py_None) {
+        PyErr_Format(PyExc_TypeError,
+                     "__init__() should return None, not '%.200s'",
+                     Py_TYPE(res)->tp_name);
+        Py_DECREF(res);
+        return -1;
+    }
+    Py_DECREF(res);
+    return 0;
+}
+~~~
+
+在执行slot_tp_init时，虚拟机会首先在class对象及其mro列表中搜索属性\__init__对应的操作，然后调用该操作。如果在定义class时，没有重写该属性，那么虚拟机会调用object的init方法，在object_init中，虚拟机没有对创建的实例进行操作。
+
+这里，我们可以总结一下从class对象创建instance对象的两个步骤
+
++ instance = class.\__new__(class,args,kwds)
++ class.\__init__(instance,args,kwds)
+
+### 访问实例对象的属性
+
+在test.py中，我们为class A定义了两个成员函数——不需要参数的f以及需要参数的g。在这里，我们首先看看不需要参数的成员函数的调用过程是怎样的。
+
+~~~python
+ 11          22 LOAD_NAME                2 (a)
+             24 LOAD_METHOD              3 (f)
+             26 CALL_METHOD              0
+             28 POP_TOP
+~~~
+
+python虚拟机通过load_name指令将名字空间中符号“a”对应的instance对象压入运行时堆栈中。随后的指令load_method会从instance a中获取与符号“f”对应的对象。
+
+~~~c
+case TARGET(LOAD_METHOD): {
+            /* Designed to work in tamdem with CALL_METHOD. */
+            PyObject *name = GETITEM(names, oparg);
+            PyObject *obj = TOP();
+            PyObject *meth = NULL;
+
+            int meth_found = _PyObject_GetMethod(obj, name, &meth);//获取实例obj的name方法
+
+            if (meth == NULL) {
+                /* Most likely attribute wasn't found. */
+                goto error;
+            }
+
+            if (meth_found) {
+                /* We can bypass temporary bound method object.
+                   meth is unbound method and obj is self.
+
+                   meth | self | arg1 | ... | argN
+                 */
+                SET_TOP(meth);
+                PUSH(obj);  // self
+            }
+            else {
+                /* meth is not an unbound method (but a regular attr, or
+                   something was returned by a descriptor protocol).  Set
+                   the second element of the stack to NULL, to signal
+                   CALL_METHOD that it's not a method call.
+
+                   NULL | meth | arg1 | ... | argN
+                */
+                SET_TOP(NULL);
+                Py_DECREF(obj);
+                PUSH(meth);
+            }
+            DISPATCH();
+        }
+~~~
+
+我们进入_PyObject_GetMethod进一步分析
+
+~~~C
+int
+_PyObject_GetMethod(PyObject *obj, PyObject *name, PyObject **method)
+{
+    PyTypeObject *tp = Py_TYPE(obj);
+    PyObject *descr;
+    descrgetfunc f = NULL;
+    PyObject **dictptr, *dict;
+    PyObject *attr;
+    int meth_found = 0;
+
+    assert(*method == NULL);
+	//obj是实例，Py_TYPE(obj)是obj的类型，在这里，实例a的类型是class A，class A的tp_getattro继承自object，就是PyObject_GenericGetAttr；name是一个unicode对象，所以在本例中此处的if条件为false
+    if (Py_TYPE(obj)->tp_getattro != PyObject_GenericGetAttr
+            || !PyUnicode_Check(name)) {
+        *method = PyObject_GetAttr(obj, name);
+        return 0;
+    }
+
+    if (tp->tp_dict == NULL && PyType_Ready(tp) < 0)
+        return 0;
+
+    descr = _PyType_Lookup(tp, name);//在class的mro列表中查找name对应的descriptor（在class的tp_dict中查找）；在本例中，此处的返回结果是A.__dict__.f，是一个func对象
+    if (descr != NULL) {
+        Py_INCREF(descr);
+        if (PyFunction_Check(descr) ||
+                (Py_TYPE(descr) == &PyMethodDescr_Type)) {
+            meth_found = 1;//在这里返回
+        } else {
+            f = descr->ob_type->tp_descr_get;
+            if (f != NULL && PyDescr_IsData(descr)) {//如果有descriptor并且是data descriptor，那么就调用并返回
+                *method = f(descr, obj, (PyObject *)obj->ob_type);
+                Py_DECREF(descr);
+                return 0;
+            }
+        }
+    }
+
+    dictptr = _PyObject_GetDictPtr(obj);//在instance的__dict__对象中寻找属性
+    if (dictptr != NULL && (dict = *dictptr) != NULL) {
+        Py_INCREF(dict);
+        attr = PyDict_GetItem(dict, name);
+        if (attr != NULL) {
+            Py_INCREF(attr);
+            *method = attr;
+            Py_DECREF(dict);
+            Py_XDECREF(descr);
+            return 0;
+        }
+        Py_DECREF(dict);
+    }
+
+    if (meth_found) {
+        *method = descr;
+        return 1;
+    }
+
+    if (f != NULL) {
+        //非data descriptor，返回
+        *method = f(descr, obj, (PyObject *)Py_TYPE(obj));
+        Py_DECREF(descr);
+        return 0;
+    }
+
+    if (descr != NULL) {
+        *method = descr;
+        return 0;
+    }
+
+    PyErr_Format(PyExc_AttributeError,
+                 "'%.50s' object has no attribute '%U'",
+                 tp->tp_name, name);
+    return 0;
+}
+~~~
+
+#### 描述符
+
+ python中的描述符（descriptor）是一个“绑定行为”的对象属性，在描述符中，可以通过方法重写属性的访问。如果任何一个对象定义了
+
+1. \__get__(self,instance,owner)
+2. \__set__(self,instance,value)
+3. \__delete__(self,instance)
+
+中的任何一个，这个对象就可以被称为一个描述符。如果只定义了get，那么对象就是一个non-data 描述符；如果即定义了get也定义了set，那么就是一个data描述符。
+
+~~~python
+class Desc: #data 描述符
+    def __init__(self,name):
+        self.name = name
+    def __get__(self,instance,owner):
+        print("__get__ is called")
+        print("self is "+str(self))
+        print("instance is "+str(instance))
+        print("owner is "+str(owner))
+        return instance.__dict__[self.name]
+    def __set__(self,instance,value):
+        print("__set__ is called")
+        print("self is "+str(self))
+        print("instance is "+str(instance))
+        print("value is "+str(value))
+        instance.__dict__[self.name] = value
+    def __delete__(self,instance):
+        print("__delete__ is called")
+        print("self is "+str(self))
+        print("instance is "+str(instance))
+        instance.__dict__.pop(self.name)
+
+class Test:
+    name = Desc("name")#
+    def __init__(self):
+        self.name = None#根据对源码中不同属性访问顺序的分析可知，如果实例所属的类中有同名的data描述符，那么虚拟机会优先调用data描述符中的相应方法，所以下面对实例name属性的访问都会被Test.name所拦截
+
+t = Test()
+__set__ is called
+self is <__main__.Desc object at 0x000001CEF967A820>
+instance is <__main__.Test object at 0x000001CEF9724A60>
+value is None
+
+t.name = "Tom"
+__set__ is called
+self is <__main__.Desc object at 0x000001CEF967A820>
+instance is <__main__.Test object at 0x000001CEF9724A60>
+value is Tom
+
+print("t.name is "+str(t.name))
+__get__ is called
+self is <__main__.Desc object at 0x00000279982FA820>
+instance is <__main__.Test object at 0x00000279983A4A60>
+owner is <class '__main__.Test'>
+t.name is Tom
+
+del t.name
+__delete__ is called
+self is <__main__.Desc object at 0x000001CEF967A820>
+instance is <__main__.Test object at 0x000001CEF9724A60>
+~~~
+
+在上述例子中，Desc是一个data descriptor，它作为Test类的类属性，访问优先级要比Test的实例t的同名实例属性高，也就是说，Test类的类属性——data描述符Test.name拦截了对Test类的实例t的同名属性t.name的访问。
+
+根据上述代码我们可以总结出python对方法进行选择的两条规则：
+
+1. Python虚拟机按照instance属性、class属性的顺序进行属性选择，即instance属性优于class属性；
+2. 如果在class属性中发现同名的data descriptor，那么该descriptor会优于instance属性被虚拟机选择。
+
+这两条规则在对属性进行设置时仍然会被严格遵守，换句话说，如果执行"a.value = 1"，就算在A中发现一个名为“value”的no data descriptor，那么还是会设置a.\__dict__["value"] = 1，而不会设置A中已有的value属性。
+
+#### 无参方法的调用
+
+虚拟机中通过call_method指令对我们得到的属性f进行调用。
+
+~~~C
+case TARGET(CALL_METHOD): {
+            /* Designed to work in tamdem with LOAD_METHOD. */
+            PyObject **sp, *res, *meth;
+
+            sp = stack_pointer;
+
+            meth = PEEK(oparg + 2);
+            if (meth == NULL) {
+                /* `meth` is NULL when LOAD_METHOD thinks that it's not
+                   a method call.
+
+                   Stack layout:
+
+                       ... | NULL | callable | arg1 | ... | argN
+                                                            ^- TOP()
+                                               ^- (-oparg)
+                                    ^- (-oparg-1)
+                             ^- (-oparg-2)
+
+                   `callable` will be POPed by call_function.
+                   NULL will will be POPed manually later.
+                */
+                res = call_function(&sp, oparg, NULL);
+                stack_pointer = sp;
+                (void)POP(); /* POP the NULL. */
+            }
+            else {//函数f在这里被调用
+                /* This is a method call.  Stack layout:
+
+                     ... | method | self | arg1 | ... | argN
+                                                        ^- TOP()
+                                           ^- (-oparg)
+                                    ^- (-oparg-1)
+                           ^- (-oparg-2)
+
+                  `self` and `method` will be POPed by call_function.
+                  We'll be passing `oparg + 1` to call_function, to
+                  make it accept the `self` as a first argument.
+                */
+                res = call_function(&sp, oparg + 1, NULL);//self被作为隐含参数入栈，所以要oparg要加1
+                stack_pointer = sp;
+            }
+
+            PUSH(res);
+            if (res == NULL)
+                goto error;
+            DISPATCH();
+        }
+~~~
+
+在这里我们可以看到，instance a被作为f的第一个参数——self压入栈顶，之后就开始了f的调用过程。
+
+#### 带参方法的调用
+
+与无参方法的调用过程类似，带参方法只是多了一条load_const指令，即把参数10压入堆栈。之后的过程与无参方法的调用过程类似。在这里，我们要关注的是方法g的实现。在g中，我们发现了load_attr指令和store_attr指令。与load_method指令相比，load_attr与store_attr指令在属性的搜索顺序上都是类似的。
+
+~~~C
+case TARGET(LOAD_ATTR): {
+            PyObject *name = GETITEM(names, oparg);
+            PyObject *owner = TOP();
+            PyObject *res = PyObject_GetAttr(owner, name);
+            Py_DECREF(owner);
+            SET_TOP(res);
+            if (res == NULL)
+                goto error;
+            DISPATCH();
+        }
+~~~
+
+观察load_attr指令我们可以发现，从实例中获取属性的关键在于PyObject_GetAttr函数。
+
+~~~C
+PyObject *
+PyObject_GetAttr(PyObject *v, PyObject *name)
+{
+    PyTypeObject *tp = Py_TYPE(v);
+
+    if (!PyUnicode_Check(name)) {
+        PyErr_Format(PyExc_TypeError,
+                     "attribute name must be string, not '%.200s'",
+                     name->ob_type->tp_name);
+        return NULL;
+    }//通过tp->tp_getattro获得对象的属性（优先使用）
+    if (tp->tp_getattro != NULL)
+        return (*tp->tp_getattro)(v, name);
+    if (tp->tp_getattr != NULL) {//通过tp->tp_getattr获得对象的属性
+        const char *name_str = PyUnicode_AsUTF8(name);
+        if (name_str == NULL)
+            return NULL;
+        return (*tp->tp_getattr)(v, (char *)name_str);
+    }//属性不存在抛出异常
+    PyErr_Format(PyExc_AttributeError,
+                 "'%.50s' object has no attribute '%U'",
+                 tp->tp_name, name);
+    return NULL;
+}
+~~~
+
+虚拟机在创建class A时，会从object中继承tp_getattro，所以这里执行的就是PyObject_GenericGetAttr函数。
+
+~~~C
+PyObject *
+PyObject_GenericGetAttr(PyObject *obj, PyObject *name)
+{
+    return _PyObject_GenericGetAttrWithDict(obj, name, NULL, 0);
+}
+
+PyObject *
+_PyObject_GenericGetAttrWithDict(PyObject *obj, PyObject *name,
+                                 PyObject *dict, int suppress)
+{
+    /* Make sure the logic of _PyObject_GetMethod is in sync with
+       this method.
+
+       When suppress=1, this function suppress AttributeError.
+    */
+
+    PyTypeObject *tp = Py_TYPE(obj);
+    PyObject *descr = NULL;
+    PyObject *res = NULL;
+    descrgetfunc f;
+    Py_ssize_t dictoffset;
+    PyObject **dictptr;
+
+    if (!PyUnicode_Check(name)){
+        PyErr_Format(PyExc_TypeError,
+                     "attribute name must be string, not '%.200s'",
+                     name->ob_type->tp_name);
+        return NULL;
+    }
+    Py_INCREF(name);
+
+    if (tp->tp_dict == NULL) {
+        if (PyType_Ready(tp) < 0)
+            goto done;
+    }
+
+    descr = _PyType_Lookup(tp, name);//查找类属性
+
+    f = NULL;
+    if (descr != NULL) {
+        Py_INCREF(descr);
+        f = descr->ob_type->tp_descr_get;
+        if (f != NULL && PyDescr_IsData(descr)) {//data descriptor优先调用__get__
+            res = f(descr, obj, (PyObject *)obj->ob_type);
+            if (res == NULL && suppress &&
+                    PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                PyErr_Clear();
+            }
+            goto done;
+        }
+    }
+
+    if (dict == NULL) {//获取实例对象的__dict__属性
+        /* Inline _PyObject_GetDictPtr */
+        dictoffset = tp->tp_dictoffset;
+        if (dictoffset != 0) {
+            if (dictoffset < 0) {
+                Py_ssize_t tsize;
+                size_t size;
+
+                tsize = ((PyVarObject *)obj)->ob_size;
+                if (tsize < 0)
+                    tsize = -tsize;
+                size = _PyObject_VAR_SIZE(tp, tsize);
+                _PyObject_ASSERT(obj, size <= PY_SSIZE_T_MAX);
+
+                dictoffset += (Py_ssize_t)size;
+                _PyObject_ASSERT(obj, dictoffset > 0);
+                _PyObject_ASSERT(obj, dictoffset % SIZEOF_VOID_P == 0);
+            }
+            dictptr = (PyObject **) ((char *)obj + dictoffset);
+            dict = *dictptr;
+        }
+    }
+    if (dict != NULL) {
+        Py_INCREF(dict);
+        res = PyDict_GetItem(dict, name);//在instance.__dict__中查找属性，找到则返回
+        if (res != NULL) {
+            Py_INCREF(res);
+            Py_DECREF(dict);
+            goto done;
+        }
+        Py_DECREF(dict);
+    }
+	//instance.__dict__中未找到
+    if (f != NULL) {
+        res = f(descr, obj, (PyObject *)Py_TYPE(obj));//non-data descriptor调用__get__方法
+        if (res == NULL && suppress &&
+                PyErr_ExceptionMatches(PyExc_AttributeError)) {
+            PyErr_Clear();
+        }
+        goto done;
+    }
+
+    if (descr != NULL) {
+        res = descr;//其他情况
+        descr = NULL;
+        goto done;
+    }
+
+    if (!suppress) {
+        PyErr_Format(PyExc_AttributeError,
+                     "'%.50s' object has no attribute '%U'",
+                     tp->tp_name, name);
+    }
+  done:
+    Py_XDECREF(descr);
+    Py_DECREF(name);
+    return res;
+}
+~~~
+
+可以看出，load_attr对属性的查找规则与load_method对方法的查找规则是类似的，即load_method是load_attr的一个“特化”版本。
