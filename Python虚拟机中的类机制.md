@@ -1692,6 +1692,8 @@ PyObject_GetAttr(PyObject *v, PyObject *name)
                      name->ob_type->tp_name);
         return NULL;
     }//通过tp->tp_getattro获得对象的属性（优先使用）
+    //如果重写类的__getattribute__方法，那么这里的tp_getattro就会指向重写的方法，进行属性查找时会执行我们自定义的__getattribute__
+    //如果重写类的__getattr__方法，那么__getattr__会作为最后的获取属性的方法被调用
     if (tp->tp_getattro != NULL)
         return (*tp->tp_getattro)(v, name);
     if (tp->tp_getattr != NULL) {//通过tp->tp_getattr获得对象的属性
@@ -1823,3 +1825,111 @@ _PyObject_GenericGetAttrWithDict(PyObject *obj, PyObject *name,
 ~~~
 
 可以看出，load_attr对属性的查找规则与load_method对方法的查找规则是类似的，即load_method是load_attr的一个“特化”版本。
+
+## 元类的使用
+
+pyhton中可以使用type在运行时动态创建类型。
+
+~~~python
+def fn1(self):
+    print("instance method of "+str(self))
+@staticmethod
+def fn2():
+    print("static method")
+@classmethod
+def fn3(cls):
+    print("class method of "+str(cls))
+
+Test = type("Test",(object,),{"fn1":fn1,"fn2":fn2,"fn3":fn3})
+~~~
+
+### metaclass的使用
+
+python中可以通过metaclass动态创建类。
+
+我们来给继承自List的MyList增加一个add方法。
+
+~~~python
+class ListMetaclass(type)://必须显式继承自type；定义并实现__new__方法
+    def __new__(cls,name,bases,attrs):
+        attrs['add'] = lambda self,value:self.append(value)
+        return type.__new__(cls,name,bases,attrs)
+//通过关键字参数metaclass
+class MyList(list,metaclass=ListMetaclass):
+    pass
+
+>>> l = MyList()
+>>> l.add(1)
+>>> l
+[1]
+~~~
+
+在构造MyList时，我们传入了metaclass，所以虚拟机调用了ListMetaclass.\__new__来执行新类的创建。new方法接收的对象依次是：
+
+1. 当前准备创建的类的对象；
+2. 类名
+3. 类的父类集合
+4. 类的所有属性、方法的集合
+
+对于动态定义类的场景，必须使用元类。
+
+ORM全称是对象-关系映射，就是把关系型数据库的一张表映射为一个类，即把数据库的一行映射为一个对象。要编写ORM框架，所有的类都只能动态定义。
+
+~~~python
+class Field(object):#保存数据库表的字段名和字段类型
+    def __init__(self,name,column_type):
+        self.name = name
+        self.column_type = column_type#可以根据column_type对传入的参数进行校验
+    def __str__(self):
+        return "<%s:%s>"%(self.__class__.__name__,self.name)
+#在Field的基础上派生出各种字段类型
+class StringField(Field):
+    def __init__(self,name):
+        super(StringField,self).__init__(name,'varchar(100)')
+class IntegerField(Field):
+    def __init__(self,name):
+        super(IntegerField,self).__init__(name,'bigint')
+
+class ModelMetaclass(type):
+    def __new__(cls,name,bases,attrs):
+        if name == "Model":#排除对Model类的修改
+            return type.__new__(cls,name,bases,attrs)
+        mappings = dict()
+        for k,v in attrs.items():#在当前类中查找定义的类的所有属性，将找到的Field属性放到一个dict中，同时从类属性中删除该Field属性
+            if isinstance(v,Field):
+                mappings[k] = v
+        for k in mappings.keys():#从类属性中删除
+            attrs.pop(k)
+        attrs['__mappings__'] = mappings#
+        attrs['__table__'] = name#假设表名和类名一致
+        return type.__new__(cls,name,bases,attrs)
+
+class Model(dict,metaclass=ModelMetaclass):#Model继承自dict类
+    def __init__(self,**kw):
+        super(Model,self).__init__(**kw)
+    def __getattr__(self,key):#重写getattr与setattr
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError("Can't find attribute %s"%key)
+    def __setattr__(self,key,value):
+        self[key] = value
+    def save(self):
+        fields = []
+        params = []
+        args = []
+        for k,v in self.__mappings__.items():#组装sql语句
+            fields.append(v.name)#
+            params.append("?")
+            args.append(getattr(self,k,None))
+        sql = 'insert into %s (%s) values (%s)' % (self.__table__,','.join(fields),','.join(params))
+        print("SQL is %s"%sql)
+        print("ARGS is %s"%str(args))
+class User(Model):
+    id = IntegerField('id')
+    name = StringField('username')
+
+u = User(id=123456,name="Tom")
+u.save()
+~~~
+
