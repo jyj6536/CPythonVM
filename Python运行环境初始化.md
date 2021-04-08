@@ -377,3 +377,238 @@ PyCFunction_NewEx(PyMethodDef *ml, PyObject *self, PyObject *module)
 执行到这里，创建builtin模块的第一部算是基本完成了。接下来，再把python中的内建类型放到builtin中，builtin模块的创建就算基本完成了。结合pycore_init_builtins中对interp->builtins指针的设置，我们可以大致勾勒出建立完成的builtin模块的示意图。
 
 ![image-20210329083402055](Python运行环境初始化.assets/image-20210329083402055.png)
+
+## sys的创建过程
+
+在_Py_InitializeCore_impl中，虚拟机通过\_PySys_Create创建了sys模块，并像设置interp->builtins一样设置interp->sysdict。
+
+~~~C
+PyObject *sysdict = PyModule_GetDict(sysmod);
+if (sysdict == NULL) {
+    return _Py_INIT_ERR("can't initialize sys dict");
+}
+Py_INCREF(sysdict);
+interp->sysdict = sysdict;
+~~~
+
+在创建sys模块之前，虚拟机将interp->modules创建为一个dict对象。
+
+~~~C
+PyObject *modules = PyDict_New();
+if (modules == NULL) {
+    return _Py_INIT_ERR("can't make modules dictionary");
+}
+interp->modules = modules;
+~~~
+
+## sys与\__builtin__的备份
+
+在完成了对sys与\__builtin__的创建之后，为了避免对这些模块的再次初始化，python会将多有的扩展module通过一个全局dict对象来进行备份和维护。
+
+这个备份动作通过\_PyImport_FixupBuiltin来完成。
+
+~~~C
+int
+_PyImport_FixupBuiltin(PyObject *mod, const char *name, PyObject *modules)
+{
+    int res;
+    PyObject *nameobj;
+    nameobj = PyUnicode_InternFromString(name);
+    if (nameobj == NULL)
+        return -1;                       //模块，模块名，模块名/文件名，interp->modules
+    res = _PyImport_FixupExtensionObject(mod, nameobj, nameobj, modules);
+    Py_DECREF(nameobj);
+    return res;
+}
+
+static PyObject *extensions = NULL;
+
+int
+_PyImport_FixupExtensionObject(PyObject *mod, PyObject *name,
+                                 PyObject *filename, PyObject *modules)
+{
+    PyObject *dict, *key;
+    struct PyModuleDef *def;
+    int res;
+    if (extensions == NULL) {//如果extensions为空，则创建dict对象
+        extensions = PyDict_New();
+        if (extensions == NULL)
+            return -1;
+    }
+    if (mod == NULL || !PyModule_Check(mod)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    def = PyModule_GetDef(mod);//获取模块对应的def对象
+    if (!def) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    if (PyObject_SetItem(modules, name, mod) < 0)//以(名字，模块)的形式将模块设置到interp->modules
+        return -1;
+    if (_PyState_AddModule(mod, def) < 0) {
+        PyMapping_DelItem(modules, name);
+        return -1;
+    }
+    if (def->m_size == -1) {
+        if (def->m_base.m_copy) {
+            /* Somebody already imported the module,
+               likely under a different name.
+               XXX this should really not happen. */
+            Py_CLEAR(def->m_base.m_copy);
+        }
+        dict = PyModule_GetDict(mod);//获取模块的dict
+        if (dict == NULL)
+            return -1;
+        def->m_base.m_copy = PyDict_Copy(dict);//复制该dict并存储到def对象的m_base.m_copy属性中
+        if (def->m_base.m_copy == NULL)
+            return -1;
+    }
+    key = PyTuple_Pack(2, filename, name);//制作(文件名，模块名)或者(模块名，模块名)的tuple作为key
+    if (key == NULL)
+        return -1;
+    res = PyDict_SetItem(extensions, key, (PyObject *)def);//将key以及def对象保存到exensions中
+    Py_DECREF(key);
+    if (res < 0)
+        return -1;
+    return 0;
+}
+~~~
+
+上述代码执行完毕之后，模块的dict对象被复制了一份并且存储到了该模块所对应的def对象的m_base.m_copy中，而def对象又被存储到了extensions这个dict中。当python系统的module集合中的某个module需要重新加载时，只需要用extensions中备份的dict对象来创建一个新的module即可。
+
+sys与\__builtin__创建完成后的内存布局
+
+
+![image-20210407112954269](Python运行环境初始化.assets/image-20210407112954269.png)
+
+## 设置module的搜索路径
+
+python在创建了sys模块之后，会在此模块中设置python搜索一个模块是的默认路径集合。这个路径集合就是在python执行import xyz时将查看的路径集合。
+
+~~~C
+void
+PySys_SetPath(const wchar_t *path)
+{
+    PyObject *v;
+    if ((v = makepathobject(path, DELIM)) == NULL)//v时一个list对象，包含了模块搜索路径
+        Py_FatalError("can't create sys.path");
+    if (_PySys_SetObjectId(&PyId_path, v) != 0)//这个v就是sys.path所看到的路径集合
+        Py_FatalError("can't assign sys.path");
+    Py_DECREF(v);
+}
+
+int
+_PySys_SetObjectId(_Py_Identifier *key, PyObject *v)
+{
+    PyObject *sd = _PyInterpreterState_GET_UNSAFE()->sysdict;
+    if (v == NULL) {
+        if (_PyDict_GetItemId(sd, key) == NULL) {
+            return 0;
+        }
+        else {
+            return _PyDict_DelItemId(sd, key);
+        }
+    }
+    else {
+        return _PyDict_SetItemId(sd, key, v);
+    }
+}
+~~~
+
+## 创建\__main__模块
+
+在上述工作完成之后，pyhton将创建一个名为\__main__的模块。
+
+~~~C
+static _PyInitError
+add_main_module(PyInterpreterState *interp)
+{
+    PyObject *m, *d, *loader, *ann_dict;
+    m = PyImport_AddModule("__main__");//创建__main__模块并将__main__放到interp->modules中
+    if (m == NULL)
+        return _Py_INIT_ERR("can't create __main__ module");
+
+    d = PyModule_GetDict(m);//获取__main__模块中的dict对象
+    ann_dict = PyDict_New();
+    if ((ann_dict == NULL) || //设置__main__的__annotations__属性
+        (PyDict_SetItemString(d, "__annotations__", ann_dict) < 0)) {
+        return _Py_INIT_ERR("Failed to initialize __main__.__annotations__");
+    }
+    Py_DECREF(ann_dict);
+
+    if (PyDict_GetItemString(d, "__builtins__") == NULL) {
+        PyObject *bimod = PyImport_ImportModule("builtins");//导入builtins模块
+        if (bimod == NULL) {
+            return _Py_INIT_ERR("Failed to retrieve builtins module");
+        }
+        if (PyDict_SetItemString(d, "__builtins__", bimod) < 0) {//设置__main__的__builtins__属性
+            return _Py_INIT_ERR("Failed to initialize __main__.__builtins__");
+        }
+        Py_DECREF(bimod);
+    }
+
+    /* Main is a little special - imp.is_builtin("__main__") will return
+     * False, but BuiltinImporter is still the most appropriate initial
+     * setting for its __loader__ attribute. A more suitable value will
+     * be set if __main__ gets further initialized later in the startup
+     * process.
+     */
+    loader = PyDict_GetItemString(d, "__loader__");
+    if (loader == NULL || loader == Py_None) {
+        PyObject *loader = PyObject_GetAttrString(interp->importlib,
+                                                  "BuiltinImporter");
+        if (loader == NULL) {
+            return _Py_INIT_ERR("Failed to retrieve BuiltinImporter");
+        }
+        if (PyDict_SetItemString(d, "__loader__", loader) < 0) {
+            return _Py_INIT_ERR("Failed to initialize __main__.__loader__");
+        }
+        Py_DECREF(loader);
+    }
+    return _Py_INIT_OK();
+}
+~~~
+
+当python以python xyz.py这样的方式执行时，python在沿着名字空间寻找\__name__时会发现其值为"\_\_main\_\_"，而如果一个py文件是以import方式加载的，\_\_name\_\_就不会为"\_\_main\_\_"。
+
+进入交互环境之后，敲入dir()就可以查看\_\_main\_\_的所有内容。
+
+~~~python
+>>> dir()
+['__annotations__', '__builtins__', '__doc__', '__loader__', '__name__', '__package__', '__spec__']
+~~~
+
+## 设置site-specific的模块搜索路径
+
+在python中，一些较大规模的第三方库通常安装在site-packages目录下，python目前的初始化动作并没有将site-packages放入python的搜索目录中。在完成了\_\_main__模块的创建之后，python虚拟机采取了将site-packages放入搜索路径的动作。这个动作的关键在于一个python标准库——site.py。
+
+~~~C
+if (core_config->site_import) {
+        err = initsite(); /* Module site */
+        if (_Py_INIT_FAILED(err)) {
+            return err;
+        }
+    }
+
+static _PyInitError
+initsite(void)
+{
+    PyObject *m;
+    m = PyImport_ImportModule("site");//导入site.py模块
+    if (m == NULL) {
+        return _Py_INIT_USER_ERR("Failed to import the site module");
+    }
+    Py_DECREF(m);
+    return _Py_INIT_OK();
+}
+~~~
+
+在site中主要执行了以下操作：
+
+1. 使用sys.prefix和sys.exec_prefix作为前缀，使用空字符串和（lib/site-packages（on windows）或者lib/pythonX.Y/site-packages（on Unix或者Macintosh）作为后缀产生最多四个目录。
+2. 对于每一个生成的目录，检查该目录是否是一个真正的目录，如果是的话，将该目录添加到sys.path并且将该目录下的路径配置文件中的路径也添加到sys.path中。
+
+到此为止，python中的大部分重要的初始化动作都已经完成了，我们来看一下初始化完成之后python为我们准备的资源。
+
+![image-20210408103528348](Python运行环境初始化.assets/image-20210408103528348.png)
