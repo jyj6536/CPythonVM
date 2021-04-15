@@ -611,4 +611,268 @@ initsite(void)
 
 到此为止，python中的大部分重要的初始化动作都已经完成了，我们来看一下初始化完成之后python为我们准备的资源。
 
-![image-20210408103528348](Python运行环境初始化.assets/image-20210408103528348.png)
+![image-20210412110447122](Python运行环境初始化.assets/image-20210412110447122.png)
+
+## 激活python虚拟机
+
+到这里，pyhton已经完成了执行所必须的基础设施的建设，但是这离python真正的执行还有一段距离。在对python虚拟机框架的分析中我们知道，python代码会被编译为python字节码，最终由一个具有巨大“for循环”结构的字节码引擎来执行。只有进入了这个字节码虚拟机后，python的初始化才算真正完成。
+
+Py_main是进入python字节码引擎的起点，我们对其内部的调用过程进行追溯——Py_main->pymain_main->pymain_run_python
+
+~~~C
+static int
+pymain_run_python(_PyMain *pymain, PyInterpreterState *interp)
+{
+    /*...*/
+    //根据不同的调用情况进行了分支
+    if (pymain->command) { //-c选项（调用PyRun_SimpleStringFlags）
+    pymain->status = pymain_run_command(pymain->command, &cf);
+    }
+    else if (pymain->module) { //-m选项（调用runpy模块的_run_module_as_main）
+        pymain->status = (pymain_run_module(pymain->module, 1) != 0);
+    }
+    else if (main_importer_path != NULL) { //python 具有__main__.py（调用runpy模块的_run_module_as_main）
+        int sts = pymain_run_module(L"__main__", 0);
+        pymain->status = (sts != 0);
+    }
+    else if (pymain->filename != NULL) { //调用PyRun_AnyFileExFlags
+        pymain_run_file(pymain, config, &cf);
+    }
+    else { //调用PyRun_AnyFileExFlags
+        pymain_run_stdin(pymain, config, &cf);
+    }
+
+    pymain_repl(pymain, config, &cf);
+    /*...*/
+}
+~~~
+
+在上面的几种情况中，调用PyObject_Call我们已经很熟悉了。对于其他两种情况我们可以发现，python虚拟机的执行流程最终都进入了那个具有巨大“for循环”结构的字节码引擎中。
+
+~~~C
+int
+PyRun_AnyFileExFlags(FILE *fp, const char *filename, int closeit,
+                     PyCompilerFlags *flags)
+{
+    if (filename == NULL)
+        filename = "???";
+    if (Py_FdIsInteractive(fp, filename)) { //分流
+        int err = PyRun_InteractiveLoopFlags(fp, filename, flags);//交互模式
+        if (closeit)
+            fclose(fp);
+        return err;
+    }
+    else
+        return PyRun_SimpleFileExFlags(fp, filename, closeit, flags);//文件模式
+}
+~~~
+
+首先来看PyRun_InteractiveLoopFlags
+
+~~~C
+int
+PyRun_InteractiveLoopFlags(FILE *fp, const char *filename_str, PyCompilerFlags *flags)
+{
+   /*...*/
+    do {
+        ret = PyRun_InteractiveOneObjectEx(fp, filename, flags);//交互式执行
+        if (ret == -1 && PyErr_Occurred()) {
+            /* Prevent an endless loop after multiple consecutive MemoryErrors
+             * while still allowing an interactive command to fail with a
+             * MemoryError. */
+            if (PyErr_ExceptionMatches(PyExc_MemoryError)) {
+                if (++nomem_count > 16) {
+                    PyErr_Clear();
+                    err = -1;
+                    break;
+                }
+            } else {
+                nomem_count = 0;
+            }
+            PyErr_Print();
+            flush_io();
+        } else {
+            nomem_count = 0;
+        }
+#ifdef Py_REF_DEBUG
+        if (show_ref_count) {
+            _PyDebug_PrintTotalRefs();
+        }
+#endif
+    } while (ret != E_EOF);
+    Py_DECREF(filename);
+    return err;
+}
+
+static int
+PyRun_InteractiveOneObjectEx(FILE *fp, PyObject *filename,
+                             PyCompilerFlags *flags)
+{
+    /*...*/
+    //编译用户在交互式环境下输入的python语句（AST）
+    mod = PyParser_ASTFromFileObject(fp, filename, enc,
+                                     Py_single_input, ps1, ps2,
+                                     flags, &errcode, arena);
+	/*...*/
+    //完成对用户输入语句的执行动作
+    m = PyImport_AddModuleObject(mod_name); //获取__main__模块
+    if (m == NULL) {
+        PyArena_Free(arena);
+        return -1;
+    }
+    d = PyModule_GetDict(m); //__main__模块的m_dict对象作为虚拟机开始执行时当前活动 的frame对象的local名字空间和global名字空间
+    v = run_mod(mod, filename, d, d, flags, arena);//执行
+    PyArena_Free(arena);
+    if (v == NULL) {
+        return -1;
+    }
+    Py_DECREF(v);
+    flush_io();
+    return 0;
+}
+
+static PyObject *
+run_mod(mod_ty mod, PyObject *filename, PyObject *globals, PyObject *locals,
+            PyCompilerFlags *flags, PyArena *arena)
+{
+    PyCodeObject *co;
+    PyObject *v;
+    co = PyAST_CompileObject(mod, filename, flags, -1, arena);//将AST编译为code对象
+    if (co == NULL)
+        return NULL;
+    v = PyEval_EvalCode((PyObject*)co, globals, locals);
+    Py_DECREF(co);
+    return v;
+}
+
+PyObject *
+PyEval_EvalCode(PyObject *co, PyObject *globals, PyObject *locals)
+{
+    return PyEval_EvalCodeEx(co,
+                      globals, locals,
+                      (PyObject **)NULL, 0,
+                      (PyObject **)NULL, 0,
+                      (PyObject **)NULL, 0,
+                      NULL, NULL);
+}
+~~~
+
+在PyEval_EvalCode中，我们终于见到了PyEval_EvalCodeEx，从这里开始，pyhton虚拟机最终将调用我们的“老朋友”——_PyEval_EvalFrameDefault——那个具有巨大“for循环”结构的字节码引擎。
+
+我们继续来看文件形式的执行过程
+
+~~~C
+int
+PyRun_SimpleFileExFlags(FILE *fp, const char *filename, int closeit,
+                        PyCompilerFlags *flags)
+{
+    PyObject *m, *d, *v;
+    const char *ext;
+    int set_file_name = 0, ret = -1;
+    size_t len;
+
+    m = PyImport_AddModule("__main__");
+    if (m == NULL)
+        return -1;
+    Py_INCREF(m);
+    d = PyModule_GetDict(m);
+    /*...*/
+    if (maybe_pyc_file(fp, filename, ext, closeit)) {
+        FILE *pyc_fp;
+        /* Try to run a pyc file. First, re-open in binary */
+        /*...*/
+        v = run_pyc_file(pyc_fp, filename, d, d, flags); //调用PyEval_EvalCode
+    } else {
+        /* When running from stdin, leave __main__.__loader__ alone */
+        if (strcmp(filename, "<stdin>") != 0 &&
+            set_main_loader(d, filename, "SourceFileLoader") < 0) {
+            fprintf(stderr, "python: failed to set __main__.__loader__\n");
+            ret = -1;
+            goto done;
+        }
+        v = PyRun_FileExFlags(fp, filename, Py_file_input, d, d,
+                              closeit, flags); //调用run_mod
+    }
+    /*...*/
+    return ret;
+}
+~~~
+
+在PyRun_SimpleFileExFlags中，程序产生了两个分支
+
+1. 如果pyc文件生效那么直接执行pyc文件；
+2. pyc文件不生效则编译执行。
+
+以上两种方法最终时殊途同归——调用_PyEval_EvalFrameDefault。
+
+到现在为止，我们对python的启动过程已经有了全面的了解——从操作系统为python创建进程一直到python字节码引擎的启动。
+
+### 名字空间
+
+我们来看一下python虚拟机激活过程中，在创建frame对象时所设置的三个名字空间：locals、globals、builtin。
+
+~~~C
+PyFrameObject* _Py_HOT_FUNCTION
+_PyFrame_New_NoTrack(PyThreadState *tstate, PyCodeObject *code,
+                     PyObject *globals, PyObject *locals)//globals与locals都是__main__模块的m_dict对象
+{	//tstate：当前state对象
+    PyFrameObject *back = tstate->frame;//在这里back一定是NULL，因为这是虚拟机创建的第一个frame对象
+    /*...*/
+    //设置builtin名字空间
+    if (back == NULL || back->f_globals != globals) {
+        builtins = _PyDict_GetItemId(globals, &PyId___builtins__);//这里的builtins就是之前创建的__builtin__模块
+        if (builtins) {
+            if (PyModule_Check(builtins)) {
+                builtins = PyModule_GetDict(builtins);
+                assert(builtins != NULL);
+            }
+        }
+        if (builtins == NULL) {
+            /* No builtins!              Make up a minimal one
+               Give them 'None', at least. */
+            builtins = PyDict_New();
+            if (builtins == NULL ||
+                PyDict_SetItemString(
+                    builtins, "None", Py_None) < 0)
+                return NULL;
+        }
+        else
+            Py_INCREF(builtins);
+
+    }
+    else {
+        /* If we share the globals, we share the builtins.
+           Save a lookup and a call. */
+        builtins = back->f_builtins;//如果back不为空，那么当前frame共享之前frame的builtin名字空间，这意味着python所有的线程都共享相同的builtin名字空间
+        assert(builtins != NULL);
+        Py_INCREF(builtins);
+    }
+    /*...*/
+    f->f_globals = globals;//设置global名字空间
+    /* Most functions have CO_NEWLOCALS and CO_OPTIMIZED set. */
+    if ((code->co_flags & (CO_NEWLOCALS | CO_OPTIMIZED)) ==
+        (CO_NEWLOCALS | CO_OPTIMIZED))
+        ; /* f_locals = NULL; will be set by PyFrame_FastToLocals() */
+    else if (code->co_flags & CO_NEWLOCALS) {
+        locals = PyDict_New();
+        if (locals == NULL) {
+            Py_DECREF(f);
+            return NULL;
+        }
+        f->f_locals = locals;
+    }
+    else {//python初始化时会执行到这里
+        if (locals == NULL)
+            locals = globals;
+        Py_INCREF(locals);
+        f->f_locals = locals;
+    }
+
+    /*...*/
+    f->f_trace_lines = 1;
+
+    return f;
+}
+~~~
+
+从这里我们可以看到，python激活时所创建的第一个frame对象的locals和globals名字空间都被设置成了\_\_main__中的dict对象；而builtin名字空间是在python所有的frame对象之间共享的。
