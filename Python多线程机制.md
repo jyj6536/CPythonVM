@@ -641,3 +641,309 @@ PyEval_RestoreThread(PyThreadState *tstate)
 
 Py_BEGIN_ALLOW_THREADS之后，一直到子线程调用Py_END_ALLOW_THREADS之前，子线程与主线程都可能会被操作系统的线程调度机制选中。这意味着在某系情况下，python的线程可以脱离GIL的控制。然而在Py_BEGIN_ALLOW_THREADS与Py_END_ALLOW_THREADS之间，python并没有调用任何的C API，只是调用了操作系统API，这不会导致共享资源的访问冲突，所以依然是线程安全的。
 
+### 用户级别的线程互斥与同步
+
+python虚拟机通过GIL实现了对虚拟机一级的共享资源的保护，但是这种保护机制是用户不能控制的。为了实现对用户资源的保护，我们需要一种可控的互斥机制——用户级别互斥。在\_thread库中提供了lock对象来实现这一目标。
+
+~~~python
+>>> import _thread
+>>> lock = _thread.allocate()
+>>> lock
+<unlocked _thread.lock object at 0x00000217535F9420>
+>>> lock.acquire()
+True
+>>> lock
+<locked _thread.lock object at 0x00000217535F9420>
+>>> lock.release()
+>>> lock
+<unlocked _thread.lock object at 0x00000217535F9420>
+~~~
+
+我们从\_thread.allocate入手进行分析。
+
+~~~C
+static PyObject *
+thread_PyThread_allocate_lock(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return (PyObject *) newlockobject();
+}
+
+static lockobject *
+newlockobject(void)
+{
+    lockobject *self;
+    self = PyObject_New(lockobject, &Locktype);
+    if (self == NULL)
+        return NULL;
+    self->lock_lock = PyThread_allocate_lock();//创建lock对象
+    self->locked = 0;
+    self->in_weakreflist = NULL;
+    if (self->lock_lock == NULL) {
+        Py_DECREF(self);
+        PyErr_SetString(ThreadError, "can't allocate lock");
+        return NULL;
+    }
+    return self;
+}
+
+PyThread_type_lock
+PyThread_allocate_lock(void)
+{
+    pthread_lock *lock;
+    int status, error = 0;
+
+    dprintf(("PyThread_allocate_lock called\n"));
+    if (!initialized)
+        PyThread_init_thread();
+
+    lock = (pthread_lock *) PyMem_RawMalloc(sizeof(pthread_lock));
+    if (lock) {
+        memset((void *)lock, '\0', sizeof(pthread_lock));
+        lock->locked = 0;
+
+        status = pthread_mutex_init(&lock->mut,
+                                    pthread_mutexattr_default);//创建互斥锁
+        CHECK_STATUS_PTHREAD("pthread_mutex_init");
+        /* Mark the pthread mutex underlying a Python mutex as
+           pure happens-before.  We can't simply mark the
+           Python-level mutex as a mutex because it can be
+           acquired and released in different threads, which
+           will cause errors. */
+        _Py_ANNOTATE_PURE_HAPPENS_BEFORE_MUTEX(&lock->mut);
+
+        status = pthread_cond_init(&lock->lock_released,
+                                   pthread_condattr_default);//创建条件变量
+        CHECK_STATUS_PTHREAD("pthread_cond_init");
+
+        if (error) {
+            PyMem_RawFree((void *)lock);
+            lock = 0;
+        }
+    }
+
+    dprintf(("PyThread_allocate_lock() -> %p\n", lock));
+    return (PyThread_type_lock) lock;
+}
+
+typedef void *PyThread_type_lock;
+
+typedef struct {
+    char             locked; /* 0=unlocked, 1=locked */
+    /* a <cond, mutex> pair to handle an acquire of a locked lock */
+    pthread_cond_t   lock_released;
+    pthread_mutex_t  mut;
+} pthread_lock;
+~~~
+
+可以看到，thread_PyThread_allocate_lock调用newlockobject创建了一个lockobject对象，而这个lockobject的lock_lock又是通过
+
+PyThread_allocate_lock分配的。我们来看一下lockobject所提供的属性集合。
+
+~~~C
+static PyMethodDef lock_methods[] = {
+    {"acquire_lock", (PyCFunction)(void(*)(void))lock_PyThread_acquire_lock,
+     METH_VARARGS | METH_KEYWORDS, acquire_doc},
+    {"acquire",      (PyCFunction)(void(*)(void))lock_PyThread_acquire_lock,
+     METH_VARARGS | METH_KEYWORDS, acquire_doc},
+    {"release_lock", (PyCFunction)lock_PyThread_release_lock,
+     METH_NOARGS, release_doc},
+    {"release",      (PyCFunction)lock_PyThread_release_lock,
+     METH_NOARGS, release_doc},
+    {"locked_lock",  (PyCFunction)lock_locked_lock,
+     METH_NOARGS, locked_doc},
+    {"locked",       (PyCFunction)lock_locked_lock,
+     METH_NOARGS, locked_doc},
+    {"__enter__",    (PyCFunction)(void(*)(void))lock_PyThread_acquire_lock,
+     METH_VARARGS | METH_KEYWORDS, acquire_doc},
+    {"__exit__",    (PyCFunction)lock_PyThread_release_lock,
+     METH_VARARGS, release_doc},
+    {NULL,           NULL}              /* sentinel */
+};
+~~~
+
+lockobject提供的操作很简单——acquire、release和判断当前lock是否被锁住 的locked。
+
+我们首先来看申请锁的动作——lock_PyThread_acquire_lock。
+
+~~~C
+static PyObject *
+lock_PyThread_acquire_lock(lockobject *self, PyObject *args, PyObject *kwds)
+{
+    _PyTime_t timeout;
+    PyLockStatus r;
+    /*参数解析
+    	acquire(blocking=True, timeout=-1) -> bool
+    	根据blocking与timeout的不同情况进行参数解析
+    	blocking==True
+    		timeout >= 0
+    			挂起timeout秒若未获取到锁则超时
+    		timeout == -1
+    			挂起直到获取锁
+    		timeout < 0 and timeout != -1
+    			出错
+    	blocking==False
+    		timeout != -1
+    			出错
+    		timeout == -1
+    			立即返回
+    */
+    if (lock_acquire_parse_args(args, kwds, &timeout) < 0)
+        return NULL;
+
+    r = acquire_timed(self->lock_lock, timeout);//竞争lock
+    if (r == PY_LOCK_INTR) {
+        return NULL;
+    }
+
+    if (r == PY_LOCK_ACQUIRED)
+        self->locked = 1;
+    return PyBool_FromLong(r == PY_LOCK_ACQUIRED);
+}
+~~~
+
+真正的竞争lock的动作是在acquire_timed中发生的。
+
+~~~C
+static PyLockStatus//如果锁等被信号中断，则运行信号处理程序，如果信号处理过程中抛出异常，则返回PY_LOCK_INTR；否则根据是否在超时时间内获取锁返回PY_LOCK_ACQUIRED或者PY_LOCK_FAILURE
+acquire_timed(PyThread_type_lock lock, _PyTime_t timeout)
+{
+    PyLockStatus r;
+    _PyTime_t endtime = 0;
+    _PyTime_t microseconds;
+
+    if (timeout > 0)
+        endtime = _PyTime_GetMonotonicClock() + timeout;
+
+    do {
+        microseconds = _PyTime_AsMicroseconds(timeout, _PyTime_ROUND_CEILING);
+
+        /* first a simple non-blocking try without releasing the GIL */
+        r = PyThread_acquire_lock_timed(lock, 0, 0);//尝试性地获取锁
+        if (r == PY_LOCK_FAILURE && microseconds != 0) {
+            Py_BEGIN_ALLOW_THREADS//[A]释放GIL允许其他线程调度
+            r = PyThread_acquire_lock_timed(lock, microseconds, 1);//获取锁
+            Py_END_ALLOW_THREADS//[B]竞争GIL
+        }
+
+        if (r == PY_LOCK_INTR) {
+            /* Run signal handlers if we were interrupted.  Propagate
+             * exceptions from signal handlers, such as KeyboardInterrupt, by
+             * passing up PY_LOCK_INTR.  */
+            if (Py_MakePendingCalls() < 0) {
+                return PY_LOCK_INTR;
+            }
+
+            /* If we're using a timeout, recompute the timeout after processing
+             * signals, since those can take time.  */
+            if (timeout > 0) {
+                timeout = endtime - _PyTime_GetMonotonicClock();
+
+                /* Check for negative values, since those mean block forever.
+                 */
+                if (timeout < 0) {
+                    r = PY_LOCK_FAILURE;
+                }
+            }
+        }
+    } while (r == PY_LOCK_INTR);  /* Retry if we were interrupted. */
+
+    return r;
+}
+
+PyLockStatus
+PyThread_acquire_lock_timed(PyThread_type_lock lock, PY_TIMEOUT_T microseconds,
+                            int intr_flag)
+{
+    PyLockStatus success = PY_LOCK_FAILURE;
+    pthread_lock *thelock = (pthread_lock *)lock;
+    int status, error = 0;
+
+    dprintf(("PyThread_acquire_lock_timed(%p, %lld, %d) called\n",
+             lock, microseconds, intr_flag));
+
+    if (microseconds == 0) {
+        status = pthread_mutex_trylock( &thelock->mut );//非阻塞
+        if (status != EBUSY)
+            CHECK_STATUS_PTHREAD("pthread_mutex_trylock[1]");
+    }
+    else {
+        status = pthread_mutex_lock( &thelock->mut );//阻塞
+        CHECK_STATUS_PTHREAD("pthread_mutex_lock[1]");
+    }
+    if (status == 0) {
+        if (thelock->locked == 0) {
+            success = PY_LOCK_ACQUIRED;
+        }//当前锁已被占有，进入等待流程
+        else if (microseconds != 0) {
+            struct timespec ts;
+            if (microseconds > 0)
+                MICROSECONDS_TO_TIMESPEC(microseconds, ts);
+            /* continue trying until we get the lock */
+
+            /* mut must be locked by me -- part of the condition
+             * protocol */
+            while (success == PY_LOCK_FAILURE) {
+                if (microseconds > 0) {
+                    status = pthread_cond_timedwait(//将当前线程挂起并释放互斥锁
+                        &thelock->lock_released,
+                        &thelock->mut, &ts);
+                    if (status == ETIMEDOUT)
+                        break;
+                    CHECK_STATUS_PTHREAD("pthread_cond_timed_wait");
+                }
+                else {
+                    status = pthread_cond_wait(//将当前线程挂起并释放互斥锁
+                        &thelock->lock_released,
+                        &thelock->mut);
+                    CHECK_STATUS_PTHREAD("pthread_cond_wait");
+                }
+
+                if (intr_flag && status == 0 && thelock->locked) {
+                    /* We were woken up, but didn't get the lock.  We probably received
+                     * a signal.  Return PY_LOCK_INTR to allow the caller to handle
+                     * it and retry.  */
+                    success = PY_LOCK_INTR;
+                    break;
+                }
+                else if (status == 0 && !thelock->locked) {//成功
+                    success = PY_LOCK_ACQUIRED;
+                }
+            }
+        }
+        if (success == PY_LOCK_ACQUIRED) thelock->locked = 1;//成功
+        status = pthread_mutex_unlock( &thelock->mut );//释放互斥锁
+        CHECK_STATUS_PTHREAD("pthread_mutex_unlock[1]");
+    }
+
+    if (error) success = PY_LOCK_FAILURE;
+    dprintf(("PyThread_acquire_lock_timed(%p, %lld, %d) -> %d\n",
+             lock, microseconds, intr_flag, success));
+    return success;
+}
+~~~
+
+在代码[A]与代码[B]处，为了避免死锁，我们同样看到了释放以及竞争GIL的代码。现在，我们可以轻易地猜出lock的release操作所完成的操作。
+
+~~~C
+void
+PyThread_release_lock(PyThread_type_lock lock)
+{
+    pthread_lock *thelock = (pthread_lock *)lock;
+    int status, error = 0;
+
+    (void) error; /* silence unused-but-set-variable warning */
+    dprintf(("PyThread_release_lock(%p) called\n", lock));
+
+    status = pthread_mutex_lock( &thelock->mut );
+    CHECK_STATUS_PTHREAD("pthread_mutex_lock[3]");
+
+    thelock->locked = 0;
+
+    /* wake up someone (anyone, if any) waiting on the lock */
+    status = pthread_cond_signal( &thelock->lock_released );//唤醒其他等待的线程
+    CHECK_STATUS_PTHREAD("pthread_cond_signal");
+
+    status = pthread_mutex_unlock( &thelock->mut );//释放互斥锁
+    CHECK_STATUS_PTHREAD("pthread_mutex_unlock[3]");
+}
+~~~
