@@ -853,7 +853,7 @@ pymalloc_free(void *ctx, void *p)
         ao->nextarena = unused_arena_objects;
         unused_arena_objects = ao;
 
-        /* Free the entire arena. */
+        /* Free the entire arena. *///将内存还给操作系统
         _PyObject_Arena.free(_PyObject_Arena.ctx,
                              (void *)ao->address, ARENA_SIZE);
         ao->address = 0;                        /* mark unassociated */
@@ -942,3 +942,9 @@ success:
 由于这种情况必须在大量持续申请小内存对象时才会出现，因为大的话会自动交给操作系统了，小的才会由arena控制，而持续申请大量小内存的情况几乎不会碰到，所以这个问题也就留在了 Python中。但是因为有些人发现了这个问题，所以这个问题在python2.5的时候就得到了解决。
 
 因为早期的python，arena是没有区分"未使用"和"可用"两种状态的，到了python2.5中，arena已经可以将自己维护的pool集合释放，交给操作系统了，从而将"可用"状态转化为"未使用"状态。而当python处理完pool，就开始处理arena了。对arena的处理分了四种情况，正如上述代码中的case1——case4。
+
+#### 内存池全景
+
+内存管理可以说是python中最复杂、最繁琐的地方了。不同尺度的内存会有不同的抽象，这些抽象在各种情况下会组成各式各样的链表，非常复杂。但是我们还是有可能从一个整体的尺度上把握整个内存池，尽管不同的链表变幻无常，但我们只需记住，所有的内存都在arenas(或者说那个存放多个arena的数组)的掌握之中 。
+
+![image-20210727205934259](Python虚拟机的内存管理机制.assets/image-20210727205934259.png)
