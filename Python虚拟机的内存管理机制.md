@@ -948,3 +948,1064 @@ success:
 内存管理可以说是python中最复杂、最繁琐的地方了。不同尺度的内存会有不同的抽象，这些抽象在各种情况下会组成各式各样的链表，非常复杂。但是我们还是有可能从一个整体的尺度上把握整个内存池，尽管不同的链表变幻无常，但我们只需记住，所有的内存都在arenas(或者说那个存放多个arena的数组)的掌握之中 。
 
 ![image-20210727205934259](Python虚拟机的内存管理机制.assets/image-20210727205934259.png)
+
+## 循环引用的垃圾收集
+
+### 引用计数与垃圾收集
+
+在各种现代化语言的内存垃圾回收机制中，python所采用的基于引用计数的垃圾回收机制可以说是最“原始”、最简单的一种了。回想PyObject这个结构体中的两个属性，一个是对象的类型，另一个就是该对象的引用计数——ob_refcnt。与其他垃圾回收机制相比，引用计数具有实时性好的优点。任何内存，一旦没有指向它的引用，那么就会被回收。而其他的垃圾回收计数必须在特定的条件下才能进行内存回收。引用计数机制所带来的维护引用计数的额外操作，与python运行中所进行的内存分配、释放、引用赋值的次数是成正比的。这一点，相对于主流的垃圾回收技术，比如标记--清除(mark--sweep)、停止--复制(stop--copy)等方法相比是一个弱点，因为它们带来额外操作只和内存数量有关，至于多少人引用了这块内存则不关心。为了提升引用计数所带来的劣势，提升python内存管理的效率，python设计了大量的内存池机制，比如小整数对象池、字符串的intern机制，列表的freelist缓冲池等等，这些大量使用的面向特定对象的内存池机制正是为了弥补引用计数的软肋。如果说效率只是软肋的话，那么引用计数还存在一个致命的缺陷，这一缺陷几乎将引用计数机制在垃圾回收技术中判处了"死刑"，这一技术就是"循环引用"。而且也正是因为"循环引用"这个致命伤，导致在狭义上并不把引用计数机制看成是垃圾回收技术。为了解决这个问题，python引入了主流垃圾收集技术中的标记--清除和分代收集两种技术来弥补其内存管理中这一最致命的漏洞。
+
+在讨论python的垃圾处理机制之前，我们先来看一下python中对象的引用计数在什么情况下会增加，在什么情况下会减少。
+
+#### 引用计数增加
+
++ 对象被创建 a=1
++ 对象被引用 b=a
++ 对象作为函数的参数 func(a)
++ 对象被其他容器所引用等
+
+#### 引用计数减少
+
++ 对象的别名被显式销毁 del a
++ 对象的别名指向了其他对象 a=2
++ 对象离开了作用域
++ 对象的容器被销毁或者被从容器中移除等
+
+python中，可以通过sys.getrefcount来查看一个对象的引用计数。
+
+考虑如下代码
+
+~~~python
+l1 = []
+l2 = []
+l1.append(l2)
+l2.append(l1)
+del l1,l2
+~~~
+
+在上述情况下，l1、l2的引用计数永远都是1，因此l1、l2都不会被回收，然而我们是希望l1、l2被回收的。所以除了引用计数，我们需要引入别的垃圾回收技术。为了解决这个问题，python引入了标记--清除和分代收集来弥补这个致命缺陷。
+
+### 三色标记模型
+
+标记--清除垃圾回收算法分为两个阶段：垃圾检测和垃圾回收，其简要过程如下：
+
++ 寻找根对象（root object）。所谓的root object就是一些就是一些全局引用和函数栈的引用。这些引用所用的对象是不可被删除的，而这个root object集合也是垃圾检测动作的起点
++ 从root object集合出发，沿着root object集合中的每一个引用，如果能到达某个对象A，则称A是可达的（reachable），可达的对象也不可被删除。这个阶段就是垃圾检测阶段
++ 当垃圾检测阶段结束后，所有的对象分为了可达的(reachable)和不可达的(unreachable)。而所有可达对象都必须予以保留，而不可达对象所占用的内存将被回收
+
+在垃圾回收动作被激活之前，系统中的所有对象之间组成了一张有向图，节点是对象，而对象之间的引用则是图的边。开始时我们假设系统中所有对象都是不可达的，对应在有向图上就是白色。随后从root object集合中的某一个对象开始，我们沿着该对象的引用链到达了某个对象A并将A标记为灰色，这意味着A是一个可达对象。然后我们检查A中所包含的引用。如果A中所包含的引用都被检查过了，那我们将A标记为黑色。显然，此时A中引用的对象则被标记成了灰色。假如我们从root object集合开始，按照广度优先的策略进行搜索的话，那么最终所有可达对象都会被标记为黑色，此时，本轮垃圾检测就结束了。
+
+![image-20210812174456175](Python虚拟机的内存管理机制.assets/image-20210812174456175.png)
+
+## Python中的垃圾回收
+
+根据对引用计数缺陷的分析我们可以知道，只有当一个对象可以持有其他对象的引用时，循环引用导致垃圾无法回收这种情况才有可能发生。python中的循环引用只有可能发生在container之间，比如list、dict、tuple、instance等。当python开始进行垃圾回收时，只需要检查container对象。为了做到这一点，python必须跟踪所创建的每一个container对象。python内部采用了一个双向链表，所有的container对象被创建之后，都会被插入到这个链表中。
+
+### 可收集对象链表
+
+为了将container对象放入可收集链表中，python在每一个container对象前面都加入了额外的信息——PyGC_Head。
+
+~~~C
+/* GC information is stored BEFORE the object structure. */
+typedef struct {
+    // Pointer to next object in the list.
+    // 0 means the object is not tracked
+    uintptr_t _gc_next;
+
+    // Pointer to previous object in the list.
+    // Lowest two bits are used for flags documented later.
+    uintptr_t _gc_prev;
+} PyGC_Head;
+~~~
+
+加入PyGC_Head之后对象的布局如下
+
+![image-20210813144539970](Python虚拟机的内存管理机制.assets/image-20210813144539970.png)
+
+我们来看一下可收集container的创建过程
+
+~~~C
+PyObject *
+_PyObject_GC_New(PyTypeObject *tp)
+{
+    PyObject *op = _PyObject_GC_Malloc(_PyObject_SIZE(tp));
+    if (op != NULL)
+        op = PyObject_INIT(op, tp);
+    return op;
+}
+
+PyObject *
+_PyObject_GC_Malloc(size_t basicsize)
+{
+    return _PyObject_GC_Alloc(0, basicsize);
+}
+
+static PyObject *
+_PyObject_GC_Alloc(int use_calloc, size_t basicsize)
+{
+    PyObject *op;
+    PyGC_Head *g;
+    size_t size;
+    if (basicsize > PY_SSIZE_T_MAX - sizeof(PyGC_Head))
+        return PyErr_NoMemory();
+    size = sizeof(PyGC_Head) + basicsize;//将PyGC_Head和待创建对象的内存需求相加
+    if (use_calloc)//为对象本身和PyGC_Head申请内存
+        g = (PyGC_Head *)PyObject_Calloc(1, size);
+    else
+        g = (PyGC_Head *)PyObject_Malloc(size);
+    if (g == NULL)
+        return PyErr_NoMemory();
+    assert(((uintptr_t)g & 3) == 0);  // g must be aligned 4bytes boundary
+    g->_gc_next = 0;//_gc_next为0代表该对象未被垃圾回收系统追踪
+    g->_gc_prev = 0;
+    _PyRuntime.gc.generations[0].count++; /* number of allocated GC objects */
+    if (_PyRuntime.gc.generations[0].count > _PyRuntime.gc.generations[0].threshold &&
+        _PyRuntime.gc.enabled &&
+        _PyRuntime.gc.generations[0].threshold &&
+        !_PyRuntime.gc.collecting &&
+        !PyErr_Occurred()) {
+        _PyRuntime.gc.collecting = 1;
+        collect_generations();
+        _PyRuntime.gc.collecting = 0;
+    }
+    op = FROM_GC(g);
+    return op;
+}
+~~~
+
+当垃圾回收机制运行期间，我们需要在一个可收集的container对象的PyGC_Head部分和PyObject_HEAD部分之间来回切换。更清楚的说，某些时候，我们持有一个对象A的PyObject_HEAD的地址，但是我们需要根据这个地址来获得PyGC_Head的地址；而且某些时候，我们又需要反过来进行逆运算。而python提供了两个地址之间的转换算法
+
+~~~C
+#define _Py_AS_GC(o) ((PyGC_Head *)(o)-1)
+
+/* Get an object's GC head */
+#define AS_GC(o) ((PyGC_Head *)(o)-1)
+
+/* Get the object given the GC head */
+#define FROM_GC(g) ((PyObject *)(((PyGC_Head *)g)+1))
+~~~
+
+在创建某个container的最后一，该对象被链接到了python内部维护的可收集对象链表中，以list对象的创建为例
+
+~~~C
+PyObject *
+PyList_New(Py_ssize_t size)
+{
+    PyListObject *op;
+    /*...*/
+    Py_SIZE(op) = size;
+    op->allocated = size;
+    _PyObject_GC_TRACK(op);
+    return (PyObject *) op;
+}
+
+static inline void _PyObject_GC_TRACK_impl(const char *filename, int lineno,
+                                           PyObject *op)
+{
+    _PyObject_ASSERT_FROM(op, !_PyObject_GC_IS_TRACKED(op),
+                          "object already tracked by the garbage collector",
+                          filename, lineno, "_PyObject_GC_TRACK");
+
+    PyGC_Head *gc = _Py_AS_GC(op);
+    _PyObject_ASSERT_FROM(op,
+                          (gc->_gc_prev & _PyGC_PREV_MASK_COLLECTING) == 0,
+                          "object is in generation which is garbage collected",
+                          filename, lineno, "_PyObject_GC_TRACK");
+	//将op插入last与_PyRuntime.gc.generation0之间
+    PyGC_Head *last = (PyGC_Head*)(_PyRuntime.gc.generation0->_gc_prev);
+    _PyGCHead_SET_NEXT(last, gc);
+    _PyGCHead_SET_PREV(gc, last);
+    _PyGCHead_SET_NEXT(gc, _PyRuntime.gc.generation0);
+    _PyRuntime.gc.generation0->_gc_prev = (uintptr_t)gc;
+}
+
+#define _PyObject_GC_TRACK(op) \
+    _PyObject_GC_TRACK_impl(__FILE__, __LINE__, _PyObject_CAST(op))
+~~~
+
+可以看到，在\_PyObject_GC_TRACK之后，我们创建的container对象已经置身于python垃圾回收机制的控制之下了。同样，python也提供了一个将container对象从可收集对象链表中摘除的方法。
+
+~~~C
+static inline void _PyObject_GC_UNTRACK_impl(const char *filename, int lineno,
+                                             PyObject *op)
+{
+    _PyObject_ASSERT_FROM(op, _PyObject_GC_IS_TRACKED(op),
+                          "object not tracked by the garbage collector",
+                          filename, lineno, "_PyObject_GC_UNTRACK");
+
+    PyGC_Head *gc = _Py_AS_GC(op);
+    PyGC_Head *prev = _PyGCHead_PREV(gc);
+    PyGC_Head *next = _PyGCHead_NEXT(gc);
+    _PyGCHead_SET_NEXT(prev, next);
+    _PyGCHead_SET_PREV(next, prev);
+    gc->_gc_next = 0;
+    gc->_gc_prev &= _PyGC_PREV_MASK_FINALIZED;
+}
+
+#define _PyObject_GC_UNTRACK(op) \
+    _PyObject_GC_UNTRACK_impl(__FILE__, __LINE__, _PyObject_CAST(op))
+~~~
+
+### 垃圾的分代回收
+
+同一程序中，不同内存块的生存周期是不同的。有的被申请之后很快就会被回收，而有的生存周期比较长，甚至会从程序开始一致持续到程序结束。对于生存期较长的内存块，我们应该降低对其进行垃圾回收的概率。python中采用了分代回收的垃圾回收机制，总共分三个“代”，每一代就是一条可收紧对象链表。很明显，_PyRuntime.gc.generation0这个变量就是0代内存的表头。
+
+~~~C
+//_PyRuntime.gc的定义
+struct _gc_runtime_state {
+    /* List of objects that still need to be cleaned up, singly linked
+     * via their gc headers' gc_prev pointers.  */
+    PyObject *trash_delete_later;
+    /* Current call-stack depth of tp_dealloc calls. */
+    int trash_delete_nesting;
+
+    int enabled;
+    int debug;
+    /* linked lists of container objects */
+    struct gc_generation generations[NUM_GENERATIONS];//通过这个数组控制了三条可收集对象链表，这就是python中用于分代垃圾收集的三个"代"
+    //0代对象
+    PyGC_Head *generation0;
+    /* a permanent generation which won't be collected */
+    struct gc_generation permanent_generation;
+    struct gc_generation_stats generation_stats[NUM_GENERATIONS];
+    /* true if we are currently running the collector */
+    int collecting;
+    /* list of uncollectable objects */
+    PyObject *garbage;
+    /* a list of callbacks to be invoked when collection is performed */
+    PyObject *callbacks;
+    /* This is the number of objects that survived the last full
+       collection. It approximates the number of long lived objects
+       tracked by the GC.
+
+       (by "full collection", we mean a collection of the oldest
+       generation). */
+    Py_ssize_t long_lived_total;
+    /* This is the number of objects that survived all "non-full"
+       collections, and are awaiting to undergo a full collection for
+       the first time. */
+    Py_ssize_t long_lived_pending;
+};
+
+//_PyRuntime.gc的初始化过程
+#define NUM_GENERATIONS 3
+
+#define GEN_HEAD(n) (&_PyRuntime.gc.generations[n].head)
+
+void
+_PyGC_Initialize(struct _gc_runtime_state *state)
+{
+    state->enabled = 1; /* automatic collection enabled? */
+
+#define _GEN_HEAD(n) (&state->generations[n].head)
+    struct gc_generation generations[NUM_GENERATIONS] = {//通过这个数组控制了三条可收集对象链表，这就是python中用于分代垃圾收集的三个"代"
+        /* PyGC_Head,                                    threshold,    count */
+        {{(uintptr_t)_GEN_HEAD(0), (uintptr_t)_GEN_HEAD(0)},   700,        0},
+        {{(uintptr_t)_GEN_HEAD(1), (uintptr_t)_GEN_HEAD(1)},   10,         0},
+        {{(uintptr_t)_GEN_HEAD(2), (uintptr_t)_GEN_HEAD(2)},   10,         0},
+    };
+    for (int i = 0; i < NUM_GENERATIONS; i++) {
+        state->generations[i] = generations[i];
+    };
+    state->generation0 = GEN_HEAD(0);//generation0指向的正是0代对象
+    struct gc_generation permanent_generation = {
+          {(uintptr_t)&state->permanent_generation.head,
+           (uintptr_t)&state->permanent_generation.head}, 0, 0
+    };
+    state->permanent_generation = permanent_generation;
+}
+
+//“代”的定义
+struct gc_generation {
+    PyGC_Head head;
+    int threshold; /* collection threshold */
+    int count; /* count of allocations or collections of younger
+                  generations */
+};
+~~~
+
+对于第0代gc_generation，count记录了当前这条可收集对象链表中一共有多少个对象。而在_PyObject_GC_Alloc中我们可以看到，每当新申请对象，都会进行0代对象的计数增加动作，这预示着所有新创建的对象实际上都会被加入到0代链表当中。而对于第1代和第2代gc_generation，count记录的是上一代对象收集的次数。
+
+~~~C
+_PyRuntime.gc.generations[0].count++; /* number of allocated GC objects */
+~~~
+
+对于第0代链表来说，gc_generation中的threshold则记录了该条可收集对象链表中最多可以容纳多少个可收集对象。从代码中可以知道0代链表中最多可以容纳700个对象，一旦0代链表中的container对象超过了700这个阈值就会立即触发垃圾回收机制。而对于第1代和第2代链表来说，如果上一代对象收集超过十次，那么本代也会被垃圾回收机制所处理。
+
+~~~C
+static PyObject *
+_PyObject_GC_Alloc(int use_calloc, size_t basicsize)
+{
+    /*...*/
+    if (_PyRuntime.gc.generations[0].count > _PyRuntime.gc.generations[0].threshold &&
+        _PyRuntime.gc.enabled &&
+        _PyRuntime.gc.generations[0].threshold &&
+        !_PyRuntime.gc.collecting &&
+        !PyErr_Occurred()) {
+        _PyRuntime.gc.collecting = 1;
+        collect_generations();
+        _PyRuntime.gc.collecting = 0;
+    }
+    op = FROM_GC(g);
+    return op;
+}
+
+static Py_ssize_t
+collect_generations(void)
+{
+    int i;
+    Py_ssize_t n = 0;
+
+    /* Find the oldest generation (highest numbered) where the count
+     * exceeds the threshold.  Objects in the that generation and
+     * generations younger than it will be collected. */
+    for (i = NUM_GENERATIONS-1; i >= 0; i--) {
+        if (_PyRuntime.gc.generations[i].count > _PyRuntime.gc.generations[i].threshold) {
+            /* Avoid quadratic performance degradation in number
+               of tracked objects. See comments at the beginning
+               of this file, and issue #4074.
+            */
+            if (i == NUM_GENERATIONS - 1
+                && _PyRuntime.gc.long_lived_pending < _PyRuntime.gc.long_lived_total / 4)
+                continue;
+            n = collect_with_callback(i);
+            break;
+        }
+    }
+    return n;
+}
+~~~
+
+在_PyObject_GC_Alloc中，虽然是0代可收集对象链表触发了垃圾收集，但是python会借此时机，对所有”代“内存链表都进行收集，当然，这只能在与某”代“对应的count值超过阈值时才能进行。注释中可以看到，在collect_generations，python会找到满足count超阈值的最”老“的那一”代“，然后回收这”代“以及所有比他年轻的”代“的内存。但是在源码中却看到collect_with_callback之后直接执行了break跳出了循环，年轻的”代“并没有处理。实际上，问题的关键就在collect_with_callback及其接受的参数上。这个函数时python垃圾回收的关键。
+
+### python中的标记——清除方法
+
+python中，如果当前收集的是第1代，那么垃圾收集开始之前，python会将所有比起年轻的“代”的内存链表整个地链接到第一代之后，这个操作是通过gc_list_merge实现的。
+
+~~~C
+/*将from链接到to之后*/
+static void
+gc_list_merge(PyGC_Head *from, PyGC_Head *to)
+{
+    assert(from != to);
+    if (!gc_list_is_empty(from)) {
+        PyGC_Head *to_tail = GC_PREV(to);
+        PyGC_Head *from_head = GC_NEXT(from);
+        PyGC_Head *from_tail = GC_PREV(from);
+        assert(from_head != from);
+        assert(from_tail != from);
+
+        _PyGCHead_SET_NEXT(to_tail, from_head);
+        _PyGCHead_SET_PREV(from_head, to_tail);
+
+        _PyGCHead_SET_NEXT(from_tail, to);
+        _PyGCHead_SET_PREV(to, from_tail);
+    }
+    gc_list_init(from);
+}
+
+static inline void
+gc_list_init(PyGC_Head *list)
+{
+    // List header must not have flags.
+    // We can assign pointer by simple cast.
+    list->_gc_prev = (uintptr_t)list;
+    list->_gc_next = (uintptr_t)list;
+}
+~~~
+
+此后的标记——清除算法就将在merge之后所得到的那一条链表上进行。同时，这也能解释collect_generations函数中为什么执行了一次collect_with_callback之后就直接break跳出了循环。
+
+为了描述python使用的标记——清除算法，我们需要使用一个循环引用的例子来进行描述。
+
+~~~python
+list1 = []
+list2 = []
+list1.append(list2)
+list2.append(list1)
+a = list1
+list3 = []
+list4 = []
+list3.append(list4)
+list4.append(list3)
+~~~
+
+![image-20210826203312874](Python虚拟机的内存管理机制.assets/image-20210826203312874.png)
+
+图中的数值表示对象的引用计数ob_refcnt。
+
+#### 寻找root object集合
+
+根据标记——清除算法的原理，在垃圾收集之前首先要找到root object集合。在上图中，我们可以看出，list1应该是属于root object的。但这仅仅是观察得到的，如何设计一种算法来得到这个结果呢？
+
+要找出root object对象，关键在于打破循环引用。如果两个对象的引用计数都为1，但是仅仅它们之间存在着循环引用，那么这两个对象是需要被回收的，也就是说，尽管它们的引用计数表现为非0，但是实际上有效的引用计数为0。这里，我们提出了**有效引用计数**的概念，为了从引用计数中获得优秀的引用计数，必须将循环引用的影响去除，也就是说，这个闭环从引用中摘除，而具体的实现就是两个对象各自的引用值都减去1。这样一来，两个对象的引用计数都成为了0，这样我们便挥去了循环引用的迷雾，是有效引用计数出现了真身。那么如何使两个对象的引用计数都减1呢，很简单，假设这两个对象为A和B，那么从A出发，由于它有一个对B的引用，则将B的引用计数减1；然后顺着引用达到B，发现它有一个对A的引用，那么同样会将A的引用减1，这样就完成了循环引用对象间环的删除。
+
+但是这样就引出了一个问题，假设可收集对象链表中的container对象A有一个对对象C的引用，而C并不在这个链表中，如果将C的引用计数减去1，而最后A并没有被回收，那么显然，C的引用计数被错误地减少1，这将导致未来的某个时刻对C的引用会出现悬空。这就要求我们必须在A没有被删除的情况下回复C的引用计数，可是如果采用这样的方案的话，那么维护引用计数的复杂度将成倍增长。换一个角度，其实我们有更好的做法，我们不改动真实的引用计数，而是改动引用计数的副本。对于副本，我们无论做什么样的改动，都不会影响对象生命周期的维护，因为这个副本的唯一作用就是寻找root object集合，而这个副本服用了PyGC_Head中的gc._gc_prev。在垃圾回收的第一步，就是遍历可收集对象链表，将每个对象的gc.\_gc_prev的值设置为其ob_refcnt的值。
+
+~~~C
+static void
+update_refs(PyGC_Head *containers)
+{
+    PyGC_Head *gc = GC_NEXT(containers);
+    for (; gc != containers; gc = GC_NEXT(gc)) {
+        gc_reset_refs(gc, Py_REFCNT(FROM_GC(gc)));
+        /*...*/
+        _PyObject_ASSERT(FROM_GC(gc), gc_get_refs(gc) != 0);
+    }
+}
+
+static inline void
+gc_reset_refs(PyGC_Head *g, Py_ssize_t refs)
+{//遍历可收集对象链表打破循环引用时只需要_gc_next就可以，所以python复用了_gc_prev作为引用计数的副本
+    g->_gc_prev = (g->_gc_prev & _PyGC_PREV_MASK_FINALIZED)
+        | PREV_MASK_COLLECTING
+        | ((uintptr_t)(refs) << _PyGC_PREV_SHIFT);
+}
+~~~
+
+接下来的动作就是要将循环引用从引用中摘除
+
+~~~C
+static void
+subtract_refs(PyGC_Head *containers)
+{
+    traverseproc traverse;
+    PyGC_Head *gc = GC_NEXT(containers);
+    for (; gc != containers; gc = GC_NEXT(gc)) {
+        traverse = Py_TYPE(FROM_GC(gc))->tp_traverse;
+        (void) traverse(FROM_GC(gc),
+                       (visitproc)visit_decref,
+                       NULL);
+    }
+}
+~~~
+
+其中的traverse是与特定的container对象相关的，在container对象类型中定义。一般来说，traverse都是遍历container对象中的每一个引用，然后对引用来执行某种动作，而这个动作在subtract_refs中就是visit_decref。我们以list对象为例来看一下traverse所定义的动作。
+
+~~~C
+PyTypeObject PyList_Type = {
+    (traverseproc)list_traverse,                /* tp_traverse */
+};
+
+typedef int (*traverseproc)(PyObject *, visitproc, void *);
+
+#define Py_VISIT(op)                                                    \
+    do {                                                                \
+        if (op) {                                                       \
+            int vret = visit(_PyObject_CAST(op), arg);                  \
+            if (vret)                                                   \
+                return vret;                                            \
+        }                                                               \
+    } while (0)
+
+static int
+list_traverse(PyListObject *o, visitproc visit, void *arg)
+{
+    Py_ssize_t i;
+
+    for (i = Py_SIZE(o); --i >= 0; )
+        Py_VISIT(o->ob_item[i]);
+    return 0;
+}
+~~~
+
+可以看到，对于list对象来说，traverse操作就是将visit作用于每一个list所引用的对象，而这里的visit就是visit_decref。
+
+~~~C
+static int
+visit_decref(PyObject *op, void *data)
+{
+    assert(op != NULL);
+    if (PyObject_IS_GC(op)) {
+        PyGC_Head *gc = AS_GC(op);
+        /* We're only interested in gc_refs for objects in the
+         * generation being collected, which can be recognized
+         * because only they have positive gc_refs.
+         */
+        if (gc_is_collecting(gc)) {
+            gc_decref(gc);
+        }
+    }
+    return 0;
+}
+
+static inline void
+gc_decref(PyGC_Head *g)
+{
+    _PyObject_ASSERT_WITH_MSG(FROM_GC(g),
+                              gc_get_refs(g) > 0,
+                              "refcount is too small");
+    g->_gc_prev -= 1 << _PyGC_PREV_SHIFT;//引用计数减一
+}
+~~~
+
+在完成了subtract_refs之后，所有container之间的环都被摘除了。这时，有一些container对象的引用计数的副本还不为0，这些对象就是标记——清除算法的root object。
+
+还是以上面的例子为例，加入我们执行已下python代码
+
+~~~python
+del list1,list2,list3,list4
+~~~
+
+此时的引用计数如下所示
+
+![image-20210830104551977](Python虚拟机的内存管理机制.assets/image-20210830104551977.png)
+
+执行update_refs之后
+
+![image-20210830104633536](Python虚拟机的内存管理机制.assets/image-20210830104633536.png)
+
+执行subtract_refs之后
+
+![image-20210830105006871](Python虚拟机的内存管理机制.assets/image-20210830105006871.png)
+
+#### 垃圾标记
+
+找到root object集合之后，我们就可以从root object出发，沿着引用标记不能回收的内存，由于root object集合中的对象是不能回收的，因此，被这些对象引用的对象也是不能回收的。在从root object出发之前，我们首先要将现在的内存链表一分为二——一条链表维护root object集合，成为root链表，而另一条维护剩下的对象，成为unreachable链表。然而，现在的unreachable链表不是名副其实的”unreachable“，其中的对象还有可能被root对象直接或间接地引用，一旦在标识过程中发现了这样的对象，我们就将其从unreachable链表移动到root链表中，当完成标记后，unreachable链表中剩下的就是可回收对象了。
+
+python通过move_unreachable完成了拆分。
+
+~~~C
+static void
+move_unreachable(PyGC_Head *young, PyGC_Head *unreachable)
+{
+    // previous elem in the young list, used for restore gc_prev.
+    PyGC_Head *prev = young;
+    PyGC_Head *gc = GC_NEXT(young);
+
+    /* Invariants:  all objects "to the left" of us in young are reachable
+     * (directly or indirectly) from outside the young list as it was at entry.
+     *
+     * All other objects from the original young "to the left" of us are in
+     * unreachable now, and have NEXT_MASK_UNREACHABLE.  All objects to the
+     * left of us in 'young' now have been scanned, and no objects here
+     * or to the right have been scanned yet.
+     */
+
+    while (gc != young) {
+        if (gc_get_refs(gc)) {//对于root object，遍历被其引用的container object
+            /* gc is definitely reachable from outside the
+             * original 'young'.  Mark it as such, and traverse
+             * its pointers to find any other objects that may
+             * be directly reachable from it.  Note that the
+             * call to tp_traverse may append objects to young,
+             * so we have to wait until it returns to determine
+             * the next object to visit.
+             */
+            PyObject *op = FROM_GC(gc);
+            traverseproc traverse = Py_TYPE(op)->tp_traverse;
+            _PyObject_ASSERT_WITH_MSG(op, gc_get_refs(gc) > 0,
+                                      "refcount is too small");
+            // NOTE: visit_reachable may change gc->_gc_next when
+            // young->_gc_prev == gc.  Don't do gc = GC_NEXT(gc) before!
+            (void) traverse(op,
+                    (visitproc)visit_reachable,
+                    (void *)young);
+            // relink gc_prev to prev element.
+            _PyGCHead_SET_PREV(gc, prev);
+            // gc is not COLLECTING state after here.
+            gc_clear_collecting(gc);//清除_PyGC_PREV_MASK_COLLECTING（Bit 1 is set when the object is in generation which is GCed currently.）
+            prev = gc;
+        }
+        else {//该对象可能是unreachable的，假定该对象是unreachable的，我们暂时将其放入unreachable链表中
+            /* This *may* be unreachable.  To make progress,
+             * assume it is.  gc isn't directly reachable from
+             * any object we've already traversed, but may be
+             * reachable from an object we haven't gotten to yet.
+             * visit_reachable will eventually move gc back into
+             * young if that's so, and we'll see it again.
+             */
+            // Move gc to unreachable.
+            // No need to gc->next->prev = prev because it is single linked.
+            prev->_gc_next = gc->_gc_next;
+
+            // We can't use gc_list_append() here because we use
+            // NEXT_MASK_UNREACHABLE here.
+            PyGC_Head *last = GC_PREV(unreachable);
+            // NOTE: Since all objects in unreachable set has
+            // NEXT_MASK_UNREACHABLE flag, we set it unconditionally.
+            // But this may set the flat to unreachable too.
+            // move_legacy_finalizers() should care about it.
+            last->_gc_next = (NEXT_MASK_UNREACHABLE | (uintptr_t)gc);
+            _PyGCHead_SET_PREV(gc, last);
+            gc->_gc_next = (NEXT_MASK_UNREACHABLE | (uintptr_t)unreachable);
+            unreachable->_gc_prev = (uintptr_t)gc;
+        }
+        gc = (PyGC_Head*)prev->_gc_next;
+    }
+    // young->_gc_prev must be last element remained in the list.
+    young->_gc_prev = (uintptr_t)prev;
+}
+
+static int
+visit_reachable(PyObject *op, PyGC_Head *reachable)
+{
+    if (!PyObject_IS_GC(op)) {//如果op不是GC对象则直接退出
+        return 0;
+    }
+
+    PyGC_Head *gc = AS_GC(op);
+    const Py_ssize_t gc_refs = gc_get_refs(gc);
+
+    // Ignore untracked objects and objects in other generation.
+    if (gc->_gc_next == 0 || !gc_is_collecting(gc)) {
+        return 0;
+    }
+
+    if (gc->_gc_next & NEXT_MASK_UNREACHABLE) {//此处条件成立说明move_unreachable将该对象设置为unreachable，但是该对象被root object所引用，所以我们要把该对象从unreachable链表中移动到reachable链表中
+        /* This had gc_refs = 0 when move_unreachable got
+         * to it, but turns out it's reachable after all.
+         * Move it back to move_unreachable's 'young' list,
+         * and move_unreachable will eventually get to it
+         * again.
+         */
+        // Manually unlink gc from unreachable list because
+        PyGC_Head *prev = GC_PREV(gc);
+        PyGC_Head *next = (PyGC_Head*)(gc->_gc_next & ~NEXT_MASK_UNREACHABLE);
+        _PyObject_ASSERT(FROM_GC(prev),
+                         prev->_gc_next & NEXT_MASK_UNREACHABLE);
+        _PyObject_ASSERT(FROM_GC(next),
+                         next->_gc_next & NEXT_MASK_UNREACHABLE);
+        prev->_gc_next = gc->_gc_next;  // copy NEXT_MASK_UNREACHABLE
+        _PyGCHead_SET_PREV(next, prev);
+
+        gc_list_append(gc, reachable);
+        gc_set_refs(gc, 1);
+    }
+    else if (gc_refs == 0) {//虽然gc_refs为0，但是该对象仍然是reachable，将其gc_refs设置为1以通知move_unreachable
+        /* This is in move_unreachable's 'young' list, but
+         * the traversal hasn't yet gotten to it.  All
+         * we need to do is tell move_unreachable that it's
+         * reachable.
+         */
+        gc_set_refs(gc, 1);
+    }
+    /* Else there's nothing to do.
+     * If gc_refs > 0, it must be in move_unreachable's 'young'
+     * list, and move_unreachable will eventually get to it.
+     */
+    else {
+        _PyObject_ASSERT_WITH_MSG(op, gc_refs > 0, "refcount is too small");
+    }
+    return 0;
+}
+~~~
+
+最终获得的reachable链表和unreachable链表如下图所示。
+
+![image-20210903153029308](Python虚拟机的内存管理机制.assets/image-20210903153029308.png)
+
+的到reachable链表之后，python将其并入old链表中。
+
+~~~C
+    if (young != old) {
+        if (generation == NUM_GENERATIONS - 2) {
+            _PyRuntime.gc.long_lived_pending += gc_list_size(young);
+        }
+        gc_list_merge(young, old);
+    }
+~~~
+
+到现在为止，unreachable链表中的对象就是我们要回收的垃圾对象。但是，unreachable中的对象依然不一定能被安全回收。问题出在一种特殊的container对象，即从类对象得到的实例对象。当我们在python中定义一个class时，为一位这个class定义一个特殊方法\_\_del\_\_，这在python中被称为finalizer。当一个拥有finalizer的实例对象被销毁时，首先会调用这个finalizer。现在假设在unreachable链表中有两个对象，对象B在finalizer中引用了对象A的某个操作，那么A一定要在B之后被回收，但是python无法做到这一点，python的垃圾回收不能保证顺序。为了解决这个问题，python采取了一种保守的做法——将所有具有finalizer的对象都移动到一个finalizers链表中；同时，如果一个unreachable状态的对象被finalizer所引用，那么将该对象也移动到finalizers链表中。
+
+~~~C
+static Py_ssize_t
+collect(int generation, Py_ssize_t *n_collected, Py_ssize_t *n_uncollectable,
+        int nofail)
+{
+        /* All objects in unreachable are trash, but objects reachable from
+     * legacy finalizers (e.g. tp_del) can't safely be deleted.
+     */
+    gc_list_init(&finalizers);
+    // NEXT_MASK_UNREACHABLE is cleared here.
+    // After move_legacy_finalizers(), unreachable is normal list.
+    move_legacy_finalizers(&unreachable, &finalizers);
+    /* finalizers contains the unreachable objects with a legacy finalizer;
+     * unreachable objects reachable *from* those are also uncollectable,
+     * and we move those into the finalizers list too.
+     */
+    move_legacy_finalizer_reachable(&finalizers);
+}
+
+//一个对象是否具有finalizer
+static int
+has_legacy_finalizer(PyObject *op)
+{
+    return op->ob_type->tp_del != NULL;
+}
+//将具有finalizer的对象从unreachable链表移动到finalizers链表中
+static void
+move_legacy_finalizers(PyGC_Head *unreachable, PyGC_Head *finalizers)
+{
+    PyGC_Head *gc, *next;
+    unreachable->_gc_next &= ~NEXT_MASK_UNREACHABLE;
+
+    /* March over unreachable.  Move objects with finalizers into
+     * `finalizers`.
+     */
+    for (gc = GC_NEXT(unreachable); gc != unreachable; gc = next) {
+        PyObject *op = FROM_GC(gc);
+
+        _PyObject_ASSERT(op, gc->_gc_next & NEXT_MASK_UNREACHABLE);
+        gc->_gc_next &= ~NEXT_MASK_UNREACHABLE;
+        next = (PyGC_Head*)gc->_gc_next;
+
+        if (has_legacy_finalizer(op)) {
+            gc_clear_collecting(gc);
+            gc_list_move(gc, finalizers);
+        }
+    }
+}
+
+static int
+visit_move(PyObject *op, PyGC_Head *tolist)
+{
+    if (PyObject_IS_GC(op)) {
+        PyGC_Head *gc = AS_GC(op);
+        if (gc_is_collecting(gc)) {
+            gc_list_move(gc, tolist);
+            gc_clear_collecting(gc);
+        }
+    }
+    return 0;
+}
+//将finaliers所引用的对象从unreachable链表移动到finalizers链表中
+static void
+move_legacy_finalizer_reachable(PyGC_Head *finalizers)
+{
+    traverseproc traverse;
+    PyGC_Head *gc = GC_NEXT(finalizers);
+    for (; gc != finalizers; gc = GC_NEXT(gc)) {
+        /* Note that the finalizers list may grow during this. */
+        traverse = Py_TYPE(FROM_GC(gc))->tp_traverse;
+        (void) traverse(FROM_GC(gc),
+                        (visitproc)visit_move,
+                        (void *)finalizers);
+    }
+}
+~~~
+
+到此为止，所有container对象已经被分到了三条链表中：reachable链表、unreachable链表以及finalizers链表。接下来，python针对finalizers链表中的对象调用了其tp_finalize方法。
+
+~~~C
+static void
+finalize_garbage(PyGC_Head *collectable)
+{
+    destructor finalize;
+    PyGC_Head seen;
+
+    /* While we're going through the loop, `finalize(op)` may cause op, or
+     * other objects, to be reclaimed via refcounts falling to zero.  So
+     * there's little we can rely on about the structure of the input
+     * `collectable` list across iterations.  For safety, we always take the
+     * first object in that list and move it to a temporary `seen` list.
+     * If objects vanish from the `collectable` and `seen` lists we don't
+     * care.
+     */
+    gc_list_init(&seen);
+
+    while (!gc_list_is_empty(collectable)) {
+        PyGC_Head *gc = GC_NEXT(collectable);
+        PyObject *op = FROM_GC(gc);
+        gc_list_move(gc, &seen);
+        if (!_PyGCHead_FINALIZED(gc) &&
+                PyType_HasFeature(Py_TYPE(op), Py_TPFLAGS_HAVE_FINALIZE) &&
+                (finalize = Py_TYPE(op)->tp_finalize) != NULL) {
+            _PyGCHead_SET_FINALIZED(gc);
+            Py_INCREF(op);
+            finalize(op);//执行op->tp_finalize
+            assert(!PyErr_Occurred());
+            Py_DECREF(op);
+        }
+    }
+    gc_list_merge(&seen, collectable);
+}
+~~~
+
+#### 垃圾回收
+
+在delete_garbage中，python对真正的引用计数进行了减小的操作。
+
+~~~C
+static inline int
+gc_list_is_empty(PyGC_Head *list)
+{
+    return (list->_gc_next == (uintptr_t)list);
+}
+
+static void
+delete_garbage(PyGC_Head *collectable, PyGC_Head *old)
+{
+    inquiry clear;
+
+    assert(!PyErr_Occurred());
+    while (!gc_list_is_empty(collectable)) {
+        PyGC_Head *gc = GC_NEXT(collectable);
+        PyObject *op = FROM_GC(gc);
+
+        _PyObject_ASSERT_WITH_MSG(op, Py_REFCNT(op) > 0,
+                                  "refcount is too small");
+
+        if (_PyRuntime.gc.debug & DEBUG_SAVEALL) {
+            assert(_PyRuntime.gc.garbage != NULL);
+            if (PyList_Append(_PyRuntime.gc.garbage, op) < 0) {
+                PyErr_Clear();
+            }
+        }
+        else {
+            if ((clear = Py_TYPE(op)->tp_clear) != NULL) {//调用tp_clear
+                Py_INCREF(op);
+                (void) clear(op);
+                if (PyErr_Occurred()) {
+                    PySys_WriteStderr("Exception ignored in tp_clear of "
+                                      "%.50s\n", Py_TYPE(op)->tp_name);
+                    PyErr_WriteUnraisable(NULL);
+                }
+                Py_DECREF(op);
+            }
+        }
+        if (GC_NEXT(collectable) == gc) {
+            /* object is still alive, move it, it may die later */
+            gc_list_move(gc, old);
+        }
+    }
+}
+~~~
+
+其中，python会调用对象类型中的tp_clear操作，这个操作会调整container对象中的每个被引用对象的引用计数，从而完成打破循环引用的最终目标。
+
+~~~C
+static int
+_list_clear(PyListObject *a)
+{
+    Py_ssize_t i;
+    PyObject **item = a->ob_item;
+    if (item != NULL) {
+        /* Because XDECREF can recursively invoke operations on
+           this list, we make it empty first. */
+        i = Py_SIZE(a);
+        Py_SIZE(a) = 0;
+        a->ob_item = NULL;
+        a->allocated = 0;
+        while (--i >= 0) {
+            Py_XDECREF(item[i]);
+        }
+        PyMem_FREE(item);
+    }
+    /* Never fails; the return value can be ignored.
+       Note that there is no guarantee that the list is actually empty
+       at this point, because XDECREF may have populated it again! */
+    return 0;
+}
+~~~
+
+在delete_garbage中，有一些unreachable状态的对象会被重新送回到reachable链表中，这是由于进行clear时，如果成功进行，则通常一个对象会把自己从垃圾收集机制维护的对象中摘除。由于某些原因，对象可能在clear时，没有完成必要的动作，从而没有将自己从collectable中摘除，这表示对象认为自己还不能被销毁，所以python需要将这种对象放回reachable链表中。
+
+以我们之前例子中list3和list4为例，加入首先处理list3，调用其tp_clear方法，那么会减少list4 的引用计数，此时会触发list4的tp_dealloc方法。
+
+~~~C
+static void
+list_dealloc(PyListObject *op)
+{
+    Py_ssize_t i;
+    PyObject_GC_UnTrack(op);
+    Py_TRASHCAN_SAFE_BEGIN(op)
+    if (op->ob_item != NULL) {
+        /* Do it backwards, for Christian Tismer.
+           There's a simple test case where somehow this reduces
+           thrashing when a *very* large list is created and
+           immediately deleted. */
+        i = Py_SIZE(op);
+        while (--i >= 0) {
+            Py_XDECREF(op->ob_item[i]);
+        }
+        PyMem_FREE(op->ob_item);
+    }
+    if (numfree < PyList_MAXFREELIST && PyList_CheckExact(op))
+        free_list[numfree++] = op;
+    else
+        Py_TYPE(op)->tp_free((PyObject *)op);
+    Py_TRASHCAN_SAFE_END(op)
+}
+~~~
+
+首先会将list4从链表中摘除，如同list3执行tp_clear时所做的动作，list4中list_dealloc的减少引用计数的动作也影响到了list3，使其引用计数减少为0，这导致list3也被销毁。如此，list3和list4都被安全回收了。
+
+### 垃圾收集全景
+
+通过上述分析，我们对python垃圾回收的全过程已经有了初步了解，现在我们再从全局上来看一下collect这个函数。
+
+~~~C
+/* This is the main function.  Read this to understand how the
+ * collection process works. */
+static Py_ssize_t
+collect(int generation, Py_ssize_t *n_collected, Py_ssize_t *n_uncollectable,
+        int nofail)
+{
+    int i;
+    Py_ssize_t m = 0; /* # objects collected */
+    Py_ssize_t n = 0; /* # unreachable objects that couldn't be collected */
+    PyGC_Head *young; /* the generation we are examining */
+    PyGC_Head *old; /* next older generation */
+    PyGC_Head unreachable; /* non-problematic unreachable trash */
+    PyGC_Head finalizers;  /* objects with, & reachable from, __del__ */
+    PyGC_Head *gc;
+    _PyTime_t t1 = 0;   /* initialize to prevent a compiler warning */
+
+    struct gc_generation_stats *stats = &_PyRuntime.gc.generation_stats[generation];
+
+/*...*/
+
+    if (PyDTrace_GC_START_ENABLED())
+        PyDTrace_GC_START(generation);
+
+    /* update collection and allocation counters */
+    if (generation+1 < NUM_GENERATIONS)//generation是第0代或者第1代，则更新第1代或者第2代的count值
+        _PyRuntime.gc.generations[generation+1].count += 1;
+    for (i = 0; i <= generation; i++)//count复位
+        _PyRuntime.gc.generations[i].count = 0;
+
+    /* merge younger generations with one we are currently collecting */
+    for (i = 0; i < generation; i++) {//把比当前处理的“代”更年轻的“代”合并到当前代“中”
+        gc_list_merge(GEN_HEAD(i), GEN_HEAD(generation));
+    }
+
+    /* handy references */
+    young = GEN_HEAD(generation);
+    if (generation < NUM_GENERATIONS-1)//当前代是第0代或者第1代，那么old就是第1代或者第2代
+        old = GEN_HEAD(generation+1);
+    else
+        old = young;//否则，old就是第2代本身
+
+    validate_list(young, 0);
+    validate_list(old, 0);
+    /* Using ob_refcnt and gc_refs, calculate which objects in the
+     * container set are reachable from outside the set (i.e., have a
+     * refcount greater than 0 when all the references within the
+     * set are taken into account).
+     *///寻找root object集合
+    update_refs(young);  // gc_prev is used for gc_refs
+    subtract_refs(young);
+
+    /* Leave everything reachable from outside young in young, and move
+     * everything else (in young) to unreachable.
+     * NOTE:  This used to move the reachable objects into a reachable
+     * set instead.  But most things usually turn out to be reachable,
+     * so it's more efficient to move the unreachable things.
+     */
+    gc_list_init(&unreachable);//将yong中的unreachable对象移动到unreachable链表中
+    move_unreachable(young, &unreachable);  // gc_prev is pointer again
+    validate_list(young, 0);
+
+    untrack_tuples(young);
+    /* Move reachable objects to next generation. */
+    if (young != old) {
+        if (generation == NUM_GENERATIONS - 2) {
+            _PyRuntime.gc.long_lived_pending += gc_list_size(young);
+        }
+        gc_list_merge(young, old);//将yong中的对象（reachable）移动到old中
+    }
+    else {
+        /* We only untrack dicts in full collections, to avoid quadratic
+           dict build-up. See issue #14775. */
+        untrack_dicts(young);
+        _PyRuntime.gc.long_lived_pending = 0;
+        _PyRuntime.gc.long_lived_total = gc_list_size(young);
+    }
+
+    /* All objects in unreachable are trash, but objects reachable from
+     * legacy finalizers (e.g. tp_del) can't safely be deleted.
+     */
+    gc_list_init(&finalizers);
+    // NEXT_MASK_UNREACHABLE is cleared here.
+    // After move_legacy_finalizers(), unreachable is normal list.
+    move_legacy_finalizers(&unreachable, &finalizers);//处理finalizers
+    /* finalizers contains the unreachable objects with a legacy finalizer;
+     * unreachable objects reachable *from* those are also uncollectable,
+     * and we move those into the finalizers list too.
+     */
+    move_legacy_finalizer_reachable(&finalizers);//将unreachable链表中被finalizers所引用的对象移动到finalizers链表中
+
+    validate_list(&finalizers, 0);
+    validate_list(&unreachable, PREV_MASK_COLLECTING);
+
+    /* Collect statistics on collectable objects found and print
+     * debugging information.
+     */
+    /*...*/
+
+    /* Clear weakrefs and invoke callbacks as necessary. */
+    m += handle_weakrefs(&unreachable, old);//清理弱引用
+
+    validate_list(old, 0);
+    validate_list(&unreachable, PREV_MASK_COLLECTING);
+
+    /* Call tp_finalize on objects which have one. */
+    finalize_garbage(&unreachable);//调用finalizer的tp_finalize方法
+
+    if (check_garbage(&unreachable)) { // clear PREV_MASK_COLLECTING here
+        gc_list_merge(&unreachable, old);
+    }
+    else {
+        /* Call tp_clear on objects in the unreachable set.  This will cause
+         * the reference cycles to be broken.  It may also cause some objects
+         * in finalizers to be freed.
+         */
+        delete_garbage(&unreachable, old);//真正的垃圾收集动作
+    }
+
+    /* Collect statistics on uncollectable objects found and print
+     * debugging information. */
+    /*...*/
+
+    /* Append instances in the uncollectable set to a Python
+     * reachable list of garbage.  The programmer has to deal with
+     * this if they insist on creating this type of structure.
+     */
+    handle_legacy_finalizers(&finalizers, old);//将finalizer放到_PyRuntime.gc.garbage中，同时将finalizers合并到old中
+    validate_list(old, 0);
+
+    /* Clear free list only during the collection of the highest
+     * generation */
+    if (generation == NUM_GENERATIONS-1) {
+        clear_freelists();//清理free list
+    }
+
+    /*...*/
+
+    /* Update stats */
+    /*更新统计信息*/
+    return n+m;
+}
+~~~
+
+从代码中可以看出，finalizer是不能被自动清除的，这些对象最终被放入了\_PyRuntime.gc.garbage这个list中。到了这里，我们需要指出一点，python的垃圾收集机制完全是为了打破循环引用而设计，虽然container再创建时都会被纳入垃圾收集机制的监控中，但是大多数container还是通过引用计数而被回收的，毕竟循环引用并不是普遍存在的。
+
+~~~C
+static void
+func_dealloc(PyFunctionObject *op)
+{
+    _PyObject_GC_UNTRACK(op);
+    if (op->func_weakreflist != NULL) {
+        PyObject_ClearWeakRefs((PyObject *) op);
+    }
+    (void)func_clear(op);
+    PyObject_GC_Del(op);
+}
+
+void
+PyObject_GC_Del(void *op)
+{
+    PyGC_Head *g = AS_GC(op);
+    if (_PyObject_GC_IS_TRACKED(op)) {
+        gc_list_remove(g);
+    }
+    if (_PyRuntime.gc.generations[0].count > 0) {
+        _PyRuntime.gc.generations[0].count--;
+    }
+    PyObject_FREE(g);
+}
+~~~
+
+以func对象为例，如果某个func对象的引用计数减为0，那么func_dealloc就会被调用，此时该func对象会主动将自己从垃圾收集监控的链表中摘除，然后释放内存。
+
