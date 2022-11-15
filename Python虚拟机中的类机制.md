@@ -413,7 +413,7 @@ slotptr(PyTypeObject *type, int ioffset)
 
 上图是PyList_Type初始化完成之后的整个布局。其中，虚线是编译时就已经确定的好了，而实线是运行时环境初始化时才建立的。
 
-在PyType_Ready中通过add_operators添加了PyType_Object对象中定义的一些operator之后，还会通过add_methods、add_members和add_getsets添加在PyType_Object中定义的tp_mthods、tp_members和tp_getsets函数集。这些add**的过程与add_operators类似，不过最后添加到dict中的不是PyWrapperDescrObject，而是PyMethodDescrObject、PyMemberDescrObject和PyGetSetDescrObject。
+在PyType_Ready中通过add_operators添加了PyType_Object对象中定义的一些operator之后，还会通过add_methods、add_members和add_getsets添加在PyType_Object中定义的tp_methods、tp_members和tp_getsets函数集。这些add**的过程与add_operators类似，不过最后添加到dict中的不是PyWrapperDescrObject，而是PyMethodDescrObject、PyMemberDescrObject和PyGetSetDescrObject。
 
 #### 确定MRO
 
@@ -640,7 +640,7 @@ add_subclass(PyTypeObject *base, PyTypeObject *type)
     key = PyLong_FromVoidPtr((void *) type);
     if (key == NULL)
         return -1;
-    newobj = PyWeakref_NewRef((PyObject *)type, NULL);//创建typed弱引用
+    newobj = PyWeakref_NewRef((PyObject *)type, NULL);//创建type弱引用
     if (newobj != NULL) {
         result = PyDict_SetItem(dict, key, newobj);//type的地址作为dict的key，弱引用作为value
         Py_DECREF(newobj);
@@ -705,7 +705,7 @@ type___subclasses___impl(PyTypeObject *self)
 
 上图展示了编译后的test.py的code对象之间的关系。实线表示包含关系，比如，f的对应的字节码包含在f对应的code对象中，而创建f的字节码却包含在A的code对象中。
 
-当python虚拟机开始执行test.py时，首先执行的就是“class A”这条python语句，并创建class 对象。
+当python虚拟机开始执行test.py时，首先执行的就是“class A”这条python语句，并创建class对象。
 
 
 ~~~python
@@ -1124,7 +1124,7 @@ error:
 
 ### 创建class object
 
-获取了class A的动态元信息之后就进入了class A的创建过程。在这里，虚拟机对metalcas进行了调用。
+获取了class A的动态元信息之后就进入了class A的创建过程。在这里，虚拟机对metaclass进行了调用。
 
 可调用性在python中是一个非常通用的概念。对于一个类型T来说，只要T的定义中的tp_call指针被实现，那么类型T就是可调用的。在这里，我们的metaclass明显也应该是一个可调用对象。在python中，一般情况下，metaclass都会被指定为type对象，所以我们来考察一下type对象的tp_call的具体实现。
 
@@ -1305,7 +1305,7 @@ a = A()
 
 虚拟机通过调用class A来创建A的实例对象a。虚拟机在创建了instance对象之后，通过指令store_name指令将a放到了locals名字空间中。
 
-在这里的call_function指令中，虚拟机会沿着call_function->_PyObject_FastCallKeywords->class A->ob_type->tp_call的顺序进行调用。A的类型是type，所以tp_call调用的是type.tp_call。在type.t_call中又调用了A.tp_new来创建instance对象。在这里我们知道，在A的初始化过程中，虚拟机对PyType_Ready对A进行了初始化，其中一项就是继承基类的操作，所以A.tp_new实际上也就是object.tp_new，在PyBaseObject中，tp_new指向的是object_new。创建class对象和创建instance对象的不同指出正在与tp_new的不同。创建class对象，虚拟机使用的是type_new，创建instance对象，虚拟机使用的是object_new。
+在这里的call_function指令中，虚拟机会沿着call_function->_PyObject_FastCallKeywords->class A->ob_type->tp_call的顺序进行调用。A的类型是type，所以tp_call调用的是type.tp_call。在type.tp_call中又调用了A.tp_new来创建instance对象。在这里我们知道，在A的初始化过程中，虚拟机对PyType_Ready对A进行了初始化，其中一项就是继承基类的操作，所以A.tp_new实际上也就是object.tp_new，在PyBaseObject中，tp_new指向的是object_new。创建class对象和创建instance对象的不同之处正在object\_new与tp_new的不同。创建class对象，虚拟机使用的是type_new，创建instance对象，虚拟机使用的是object_new。
 
 ```C
 static PyObject *

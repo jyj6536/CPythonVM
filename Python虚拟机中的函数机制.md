@@ -73,7 +73,7 @@ Disassembly of <code object f at 0x00000255F9E80190, file ".\test.py", line 1>:
 
 ```C
 case TARGET(MAKE_FUNCTION): {
-            PyObject *qualname = POP();//一个显示从从定义该对象的模块到到达该对象(类，函数，方法)所经路径的带.号的名字
+            PyObject *qualname = POP();//一个显示从定义该对象的模块到到达该对象(类，函数，方法)所经路径的带.号的名字
             PyObject *codeobj = POP();	//获得与函数关联的code对象
             PyFunctionObject *func = (PyFunctionObject *)
                 PyFunction_NewWithQualName(codeobj, f->f_globals, qualname);//生成函数
@@ -525,7 +525,7 @@ function_code_fastcall(PyCodeObject *co, PyObject *const *args, Py_ssize_t nargs
 
 ![image-20201216203307113](Python虚拟机中的函数机制.assets/image-20201216203307113.png)
 
-标签[A]处的for对新建栈帧的f_localsplus进行了循环赋值的操作，f->f_localsplus[0]、f->f_localsplus[1]分别被赋值为对象1、对象"age"。根据之前《Python虚拟机框架》中对frame对象结构的描述可知，f_localsplus是由两部分空间组成的——locals变量空间和运行时栈空间，函数参数也是一种局部变量，所以在这里func的参数a、b被存储到f_localsplus的起始位置与我们之前对frame对象的考察时完全符合的。
+标签[A]处的for对新建栈帧的f_localsplus进行了循环赋值的操作，f->f_localsplus[0]、f->f_localsplus[1]分别被赋值为对象1、对象"age"。根据之前《Python虚拟机框架》中对frame对象结构的描述可知，f_localsplus是由两部分空间组成的——locals变量空间和运行时栈空间，函数参数也是一种局部变量，所以在这里func的参数a、b被存储到f_localsplus的起始位置与我们之前对frame对象的考察是完全符合的。
 
 ##### 位置参数的访问
 
@@ -1294,7 +1294,7 @@ typedef struct {
 
 这个对象非常简单，仅仅维护了一个ob_ref指针，指向python中的对象。ob_ref指针在PyCell_New函数中被设置。
 
-这部分代码执行结束之后，get_func函数所对应的frame对象的cell变量区已经准备就绪，可以通过相应字节吗进行操作了。我们首先来看store_deref。
+这部分代码执行结束之后，get_func函数所对应的frame对象的cell变量区已经准备就绪，可以通过相应字节码进行操作了。我们首先来看store_deref。
 
 ```C
 case TARGET(STORE_DEREF): {
@@ -1362,7 +1362,7 @@ load_closure的实现很简单，就是把下标为oparg的cell对象压入运�
 
 在将a、b以及value对应cell对象入栈之后，虚拟机将这三个对象组装到了一个tuple中，然后将inner_func对应的code对象、“inner_func”入栈，执行36 make_function开始生成inner_func所对应的func对象。
 
-重新考察字节吗make_function
+重新考察字节码make_function
 
 ~~~C
             if (oparg & 0x08) {  

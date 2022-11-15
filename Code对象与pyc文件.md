@@ -80,9 +80,9 @@ co_cellvars ()
 
 **co_firstlineno**：Code Block在对应的py文件中的起始行．
 
-**co_code**：Code Block编译所的到的字节码指令序列，以PyStringObject的形式存在．
+**co_code**：Code Block编译所得到的字节码指令序列，以PyStringObject的形式存在．
 
-**co_consts**：一个元组对象, 包含了函数中用到的所有常量. 比如 整数, 字符串对象, 和布尔对象. 这个元组里面的内容会在字节码 LOAD_CONST 执行的时候用到, LOAD_CONST 后面会跟一个参数, 这个参数表示 co_consts 的下标位置．
+**co_consts**：一个元组对象, 包含了函数中用到的所有常量. 比如整数, 字符串对象和布尔对象. 这个元组里面的内容会在字节码 LOAD_CONST 执行的时候用到, LOAD_CONST 后面会跟一个参数, 这个参数表示 co_consts 的下标位置．
 
 **co_names**：一个元组, 元组里的对象都是字符串对象, 存储着属性, 全局变量名称, 导入的名称等信息. 用到这部分信息的字节码(比如 LOAD_ATTR)后面跟一个参数, 表示这个 co_names 的下标位置．
 
@@ -99,18 +99,18 @@ co_cellvars ()
 将字节码与对应行关联起来．co_lnotab中的每两个元素作为一个二元组，分别表示字节码位置以及行数的增量．
 
 ```python
-import dis
-
-def f1(x):
-    x = 3
-    y = 4
-
-def f2(x):
-    x = 5
-    y = 6
-print(f2.__code__.co_firstlineno)
-print(repr(list(bytearray(f2.__code__.co_lnotab))))
-print(dis.dis(f2))
+1 import dis
+2
+3 def f1(x):
+4    x = 3
+5    y = 4
+6
+7 def f2(x):
+8    x = 5
+9    y = 6
+10 print(f2.__code__.co_firstlineno)
+11 print(repr(list(bytearray(f2.__code__.co_lnotab))))
+12 print(dis.dis(f2))
 ```
 
 输出
@@ -129,7 +129,7 @@ None
 
 ```
 
-x=5的第一条字节码在字节码序列中的位置为0，对应的源文件行数为co_firstlineno(7)+1=8；y=9的第一条字节码在字节码序列中的位置为4，对应的行数为8+1=9．
+x=5的第一条字节码在字节码序列中的位置为0，对应的源文件行数为co_firstlineno(7)+1=8；y=6的第一条字节码在字节码序列中的位置为4，对应的行数为8+1=9．
 
 ### co_zombieframe
 

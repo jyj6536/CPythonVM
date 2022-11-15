@@ -77,6 +77,77 @@ import_name(PyFrameObject *f, PyObject *name, PyObject *fromlist, PyObject *leve
     Py_DECREF(import_func);
     return res;
 }
+
+PyObject *
+PyImport_ImportModuleLevelObject(PyObject *name, PyObject *globals,
+                                 PyObject *locals, PyObject *fromlist,
+                                 int level)
+{
+    _Py_IDENTIFIER(_handle_fromlist);
+    PyObject *abs_name = NULL;
+    PyObject *final_mod = NULL;
+    PyObject *mod = NULL;
+    PyObject *package = NULL;
+    PyInterpreterState *interp = _PyInterpreterState_GET_UNSAFE();
+    int has_from;
+	//名字不能为空
+    if (name == NULL) {
+        PyErr_SetString(PyExc_ValueError, "Empty module name");
+        goto error;
+    }
+
+    /* The below code is importlib.__import__() & _gcd_import(), ported to C
+       for added performance. */
+	//名字必须为PyUnicode对象
+    if (!PyUnicode_Check(name)) {
+        PyErr_SetString(PyExc_TypeError, "module name must be a string");
+        goto error;
+    }
+    if (PyUnicode_READY(name) < 0) {
+        goto error;
+    }
+    if (level < 0) {//level必须大于等于0
+        PyErr_SetString(PyExc_ValueError, "level must be >= 0");
+        goto error;
+    }
+
+    if (level > 0) {
+        abs_name = resolve_name(name, globals, level);
+        if (abs_name == NULL)
+            goto error;
+    }
+    else {  /* level == 0 */
+        if (PyUnicode_GET_LENGTH(name) == 0) {
+            PyErr_SetString(PyExc_ValueError, "Empty module name");
+            goto error;
+        }
+        abs_name = name;
+        Py_INCREF(abs_name);
+    }
+    
+    //首先从sys.modules中获取；python中，一个模块不会被重复导入，一旦导入之后会放到sys.modules中
+    mod = PyImport_GetModule(abs_name);
+    if (mod != NULL && mod != Py_None) {
+       /*...*/
+    }
+    else {
+        Py_XDECREF(mod);
+        mod = import_find_and_load(abs_name);//执行导入动作
+        if (mod == NULL) {
+            goto error;
+        }
+    }
+
+    /*...*/
+
+  error:
+    Py_XDECREF(abs_name);
+    Py_XDECREF(mod);
+    Py_XDECREF(package);
+    if (final_mod == NULL)
+        remove_importlib_frames();
+    return final_mod;
+}
 ~~~
 
 从调用import_func开始，python开始了真正的模块导入动作。在对具体的导入动作进行分析之前，我们先从黑盒探测的角度，来对python的模块导入机制进行探测。
@@ -153,7 +224,7 @@ b = 2
 
 ## 嵌套import
 
-上卖弄我们考察了对单个独立的module的import动作，下面我们来考察一下嵌套的import动作。所谓嵌套的import动作，就是指python在”import A“时，A这个module中又import了另一个module。
+上面我们考察了对单个独立的module的import动作，下面我们来考察一下嵌套的import动作。所谓嵌套的import动作，就是指python在”import A“时，A这个module中又import了另一个module。
 
 ~~~python
 # hello1.py
@@ -331,7 +402,7 @@ Lib/test/namespace_pkgs
                 two.py
 ~~~
 
-在这类，parent和chiled包都是命名空间包：parent存在于不同的目录中并且都没有\_\_init\_\_.py文件。
+在这类，parent和child包都是命名空间包：parent存在于不同的目录中并且都没有\_\_init\_\_.py文件。
 
 我们将parent的父目录添加到sys.path中
 
@@ -347,3 +418,208 @@ _NamespacePath(['Lib/test/namespace_pkgs/project1/parent/child', 'Lib/test/names
 ~~~
 
 可以看到，我们成功构建了一个名为parent的命名空间包。
+
+## import机制的实现
+
+我们知道，python中import的起点是builtin模块中\_\_import\_\_操作，也就是builtin___import\_\_函数，我们以该函数为起点开始分析。
+
+~~~C
+static PyObject *
+builtin___import__(PyObject *self, PyObject *args, PyObject *kwds)
+{
+    static char *kwlist[] = {"name", "globals", "locals", "fromlist",
+                             "level", 0};
+    PyObject *name, *globals = NULL, *locals = NULL, *fromlist = NULL;
+    int level = 0;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "U|OOOi:__import__",//从args中解析出所需要的参数
+                    kwlist, &name, &globals, &locals, &fromlist, &level))
+        return NULL;
+    return PyImport_ImportModuleLevelObject(name, globals, locals,
+                                            fromlist, level);
+}
+~~~
+
+在python中，PyArg_ParseTupleAndKeywords是一个被广泛使用的函数，其原型如下：
+
+~~~c
+PyArg_ParseTupleAndKeywords(PyObject* args,PyObject* kwds,const char *fromat,
+                    char *keyword[],...)
+~~~
+
+该函数的目的是根据format中指定的格式将args与kwds解析成各种对象（python中的对象或者C的原生类型）。在**U|OOOi:\_\_import\_\_**这个format中，U代表目标是一个Unicode对象；i则用来将int对象解析为int类型的值；而O代表解析目标依然为python中的合法对象。至于“|”与“:”，“|”表示其后的格式字符是可选的；“:”表示格式字符串到此结束，其后的字符串用于在解析过程中输出错误信息使用。
+
+完成参数解析之后，python进入了PyImport_ImportModuleLevelObject。我们继续对PyImport_ImportModuleLevelObject的调用栈进行追溯：
+
+~~~C
+PyObject *
+PyImport_ImportModuleLevelObject(PyObject *name, PyObject *globals,
+                                 PyObject *locals, PyObject *fromlist,
+                                 int level)
+{
+    /*...*/
+
+    mod = PyImport_GetModule(abs_name);
+    if (mod != NULL && mod != Py_None) {
+        _Py_IDENTIFIER(__spec__);
+        _Py_IDENTIFIER(_lock_unlock_module);
+        PyObject *spec;
+
+        /* Optimization: only call _bootstrap._lock_unlock_module() if
+           __spec__._initializing is true.
+           NOTE: because of this, initializing must be set *before*
+           stuffing the new module in sys.modules.
+         */
+        spec = _PyObject_GetAttrId(mod, &PyId___spec__);
+        if (_PyModuleSpec_IsInitializing(spec)) {
+            PyObject *value = _PyObject_CallMethodIdObjArgs(interp->importlib,
+                                            &PyId__lock_unlock_module, abs_name,
+                                            NULL);
+            if (value == NULL) {
+                Py_DECREF(spec);
+                goto error;
+            }
+            Py_DECREF(value);
+        }
+        Py_XDECREF(spec);
+    }
+    else {
+        Py_XDECREF(mod);
+        mod = import_find_and_load(abs_name); //调用import_find_and_load
+        if (mod == NULL) {
+            goto error;
+        }
+    }
+
+    /*...*/
+    return final_mod;
+}
+
+static PyObject *
+import_find_and_load(PyObject *abs_name)
+{
+   /*..*/
+
+    if (PyDTrace_IMPORT_FIND_LOAD_START_ENABLED())
+        PyDTrace_IMPORT_FIND_LOAD_START(PyUnicode_AsUTF8(abs_name));
+
+    mod = _PyObject_CallMethodIdObjArgs(interp->importlib, //调用_PyObject_CallMethodIdObjArgs
+                                        &PyId__find_and_load, abs_name,
+                                        interp->import_func, NULL);
+
+    /*...*/
+
+    return mod;
+}
+
+PyObject *
+_PyObject_CallMethodIdObjArgs(PyObject *obj,
+                              struct _Py_Identifier *name, ...)
+{
+    /*...*/
+
+    callable = _PyObject_GetAttrId(obj, name);
+    if (callable == NULL) {
+        return NULL;
+    }
+
+    va_start(vargs, name);
+    result = object_vacall(callable, vargs); //调用interp->importlib的_find_and_load方法
+    va_end(vargs);
+
+    Py_DECREF(callable);
+    return result;
+}
+~~~
+
+通过上述追溯我们可以发现，在import一个模块时，最终调用的是interp->importlib这个模块的_find_and_load方法。
+
+~~~C
+static _PyInitError
+initimport(PyInterpreterState *interp, PyObject *sysmod)
+{
+    PyObject *importlib;
+    PyObject *impmod;
+    PyObject *value;
+
+    /* Import _importlib through its frozen version, _frozen_importlib. */
+    /*...*/
+    importlib = PyImport_AddModule("_frozen_importlib");
+    if (importlib == NULL) {
+        return _Py_INIT_ERR("couldn't get _frozen_importlib from sys.modules");
+    }
+    interp->importlib = importlib;
+    Py_INCREF(interp->importlib);
+    
+    interp->import_func = PyDict_GetItemString(interp->builtins, "__import__");//interp->import_func被初始化为builtin___import__
+    if (interp->import_func == NULL)
+        return _Py_INIT_ERR("__import__ not found");
+    Py_INCREF(interp->import_func);
+
+    /*...*/
+
+    return _Py_INIT_OK();
+}
+~~~
+
+全局搜索_frozen_importlib，可以发现一个二进制文件——importlib.h：
+
+~~~C
+/* Auto-generated by Programs/_freeze_importlib.c */
+const unsigned char _Py_M__importlib_bootstrap[] = {
+    99,0,0,0,0,0,0,0,0,0,0,0,0,4,0,0,
+    0,64,0,0,0,115,194,1,0,0,100,0,90,0,100,1,
+    97,1,100,2,100,3,132,0,90,2,100,4,100,5,132,0,
+    /*...*/
+~~~
+
+根据注释可知，这个文件是由_freeze_importlib.c自动生成的，\_freeze_importlib.c会把Lib/importlib/\_bootstrap.py中的python代码转换为二进制存储到Python/importlib.h中。从这里我们可以发现，python中的import流程大致上是用python实现的，interp->importlib的\_find_and_load方法可以映射到Lib/importlib/\_bootstrap.py中的\_find_and_load这个python函数。
+
+```python
+def _find_and_load(name, import_): #根据之前的分析可知，name为abs_name，import_为interp->import_func即builtin___import__
+    """Find and load the module."""
+    with _ModuleLockManager(name):
+        module = sys.modules.get(name, _NEEDS_LOADING) #在缓存sys.modules中查找
+        if module is _NEEDS_LOADING: #没找到则调用_find_and_load_unlocked
+            return _find_and_load_unlocked(name, import_) #调用
+
+    if module is None:
+        message = ('import of {} halted; '
+                   'None in sys.modules'.format(name))
+        raise ModuleNotFoundError(message, name=name)
+
+    _lock_unlock_module(name)
+    return module
+```
+
+可以看到，python首先在缓存中查找要加载的module，找不到的话则调用\_find\_and\_load\_unlocked
+
+```python
+def _find_and_load_unlocked(name, import_):
+    path = None
+    parent = name.rpartition('.')[0] #a.b.c分解为（"a.b",".","c"）
+    if parent: #搜索parent module
+        if parent not in sys.modules: #缓存中不存在的话，则继续加载parent
+            _call_with_frames_removed(import_, parent) #这里的import_就是builtin___import__，可以看出，python的module加载过程是一个递归的过程
+        # Crazy side-effects!
+        if name in sys.modules:
+            return sys.modules[name]
+        parent_module = sys.modules[parent]
+        try:
+            path = parent_module.__path__
+        except AttributeError:
+            msg = (_ERR_MSG + '; {!r} is not a package').format(name, parent)
+            raise ModuleNotFoundError(msg, name=name) from None
+    spec = _find_spec(name, path) #创建ModuleSpec对象
+    if spec is None:
+        raise ModuleNotFoundError(_ERR_MSG.format(name), name=name)
+    else:
+        module = _load_unlocked(spec) #从ModuleSpec对象创建module
+    if parent:
+        # Set the module as an attribute on its parent.
+        parent_module = sys.modules[parent]
+        setattr(parent_module, name.rpartition('.')[2], module) #将当前module设置为其父module的属性
+    return module
+```
+
+从上面过程可以看出，python创建module是一个递归过程，首先从最低级的module开始，如果父module已经创建则直接创建子module，否则自下而上递归进行创建工作，直至所有module创建完成。

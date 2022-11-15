@@ -491,7 +491,7 @@ void
 PySys_SetPath(const wchar_t *path)
 {
     PyObject *v;
-    if ((v = makepathobject(path, DELIM)) == NULL)//v时一个list对象，包含了模块搜索路径
+    if ((v = makepathobject(path, DELIM)) == NULL)//vs一个list对象，包含了模块搜索路径
         Py_FatalError("can't create sys.path");
     if (_PySys_SetObjectId(&PyId_path, v) != 0)//这个v就是sys.path所看到的路径集合
         Py_FatalError("can't assign sys.path");

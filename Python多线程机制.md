@@ -1,6 +1,6 @@
 # Python多线程机制
 
-python中的多线程是基于操作系统的原生线程实现的，同时，python总引入了一个全局解释器锁（Global Interepter Lock, GIL）来互斥不同线程对python虚拟机的使用。在python中，GIL是一个非常大粒度的锁，同一时间的多个python线程中，只有一个持有GIL的线程才能运行。
+python中的多线程是基于操作系统的原生线程实现的，同时，python引入了一个全局解释器锁（Global Interepter Lock, GIL）来互斥不同线程对python虚拟机的使用。在python中，GIL是一个非常大粒度的锁，同一时间的多个python线程中，只有一个持有GIL的线程才能运行。
 
 对于线程调度机制而言，有两个问题是需要解决的：
 
@@ -17,7 +17,7 @@ python中的多线程是基于操作系统的原生线程实现的，同时，py
 0.005
 ~~~
 
-第二个问题是由操作系统决定的。在python中，当前线程被挂起之后选择哪一个候选线程是由操作系统来决定的，python在这个问题上完全没有进行干预。这意味着python中的线程实际上就是操作系统的原生线程。在不同的操作系统上，线程有不同的实现，然而最终，python提供了一套统一的额抽象机制，给python使用者提供了非常简单而方便的接口——python中的两个module：_thread以及在其之上的threading。
+第二个问题是由操作系统决定的。在python中，当前线程被挂起之后选择哪一个候选线程是由操作系统来决定的，python在这个问题上完全没有进行干预。这意味着python中的线程实际上就是操作系统的原生线程。在不同的操作系统上，线程有不同的实现，然而最终，python提供了一套统一的抽象机制，给python使用者提供了非常简单而方便的接口——python中的两个module：_thread以及在其之上的threading。
 
 ## _thread模块
 
@@ -278,7 +278,7 @@ _ready:
     } while (0)
 ~~~
 
-从take_gil的实现可以看出，GIL的申请逻辑都被\_PyRuntime.ceval.gil.mutex锁住。如果GIL已经被持有，则进入等待状态，通过COND_TIMED_WAIT实现超时等待，该宏在POSIX平台上实际上时调用的pthread_cond_timedwait；如果超时，则通过SET_GIL_DROP_REQUEST () 方法将 gil_drop_request、eval_breaker 这两个变量置 1，通知正在持有GIL的线程释放GIL。
+从take_gil的实现可以看出，GIL的申请逻辑都被\_PyRuntime.ceval.gil.mutex锁住。如果GIL已经被持有，则进入等待状态，通过COND_TIMED_WAIT实现超时等待，该宏在POSIX平台上实际上是调用的pthread_cond_timedwait；如果超时，则通过SET_GIL_DROP_REQUEST () 方法将 gil_drop_request、eval_breaker 这两个变量置 1，通知正在持有GIL的线程释放GIL。
 
 python虚拟机通过drop_gil主动释放GIL。
 
@@ -359,7 +359,7 @@ PyThread_start_new_thread(void (*func)(void *), void *arg)
         return PYTHREAD_INVALID_THREAD_ID;
     }
 
-    pthread_detach(th);//将线程设置为detached状态（线程退出时将堆栈、推出状态等资源立即将资源回收而不是将其保存在内存中）
+    pthread_detach(th);//将线程设置为detached状态（线程退出时将堆栈、退出状态等资源立即回收而不是将其保存在内存中）
 
 #if SIZEOF_PTHREAD_T <= SIZEOF_LONG
     return (unsigned long) th;
@@ -639,7 +639,7 @@ PyEval_RestoreThread(PyThreadState *tstate)
 
 在Py_BEGIN_ALLOW_THREADS，python释放了GIL，而在Py_END_ALLOW_THREADS中，python重新竞争了GIL。在子线程调用了
 
-Py_BEGIN_ALLOW_THREADS之后，一直到子线程调用Py_END_ALLOW_THREADS之前，子线程与主线程都可能会被操作系统的线程调度机制选中。这意味着在某系情况下，python的线程可以脱离GIL的控制。然而在Py_BEGIN_ALLOW_THREADS与Py_END_ALLOW_THREADS之间，python并没有调用任何的C API，只是调用了操作系统API，这不会导致共享资源的访问冲突，所以依然是线程安全的。
+Py_BEGIN_ALLOW_THREADS之后，一直到子线程调用Py_END_ALLOW_THREADS之前，子线程与主线程都可能会被操作系统的线程调度机制选中。这意味着在某些情况下，python的线程可以脱离GIL的控制。然而在Py_BEGIN_ALLOW_THREADS与Py_END_ALLOW_THREADS之间，python并没有调用任何的C API，只是调用了操作系统API，这不会导致共享资源的访问冲突，所以依然是线程安全的。
 
 ### 用户级别的线程互斥与同步
 
